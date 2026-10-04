@@ -45,7 +45,14 @@ function sharedSounds(): Plugin {
 export default defineConfig({
   plugins: [sharedSounds()],
   clearScreen: false,
-  server: { port: 1420, strictPort: true, host: "127.0.0.1" },
+  server: {
+    port: 1420,
+    strictPort: true,
+    host: "127.0.0.1",
+    // Cargo rewrites binaries under target/ while it compiles. Chokidar on
+    // Windows then throws EBUSY and takes the whole dev server down with it.
+    watch: { ignored: [/[/\\]target([\\/]|$)/, /[/\\]dist([\\/]|$)/] },
+  },
   envPrefix: ["VITE_", "TAURI_ENV_"],
   build: {
     target: "chrome110",

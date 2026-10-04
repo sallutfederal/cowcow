@@ -83,6 +83,9 @@ export const Bridge = {
   chatSend: (query: string, context: ChatContext | null) =>
     callOrThrow<{ text: string }>("chat_send", { query, context }),
   chatReset: () => call<void>("chat_reset"),
+
+  /** Models the local Ollama daemon has. Fails with a readable message. */
+  ollamaModels: () => callOrThrow<LocalModel[]>("ollama_models"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
   /** Only ever tells you whether a key exists — never its value. */
@@ -114,6 +117,16 @@ export interface DroppedFile {
   name: string;
   path: string;
   size: number;
+}
+
+/** One model as `GET /api/tags` describes it. */
+export interface LocalModel {
+  name: string;
+  size: number;
+  family: string | null;
+  parameterSize: string | null;
+  /** `-cloud` variants run on Ollama's servers, not on this machine. */
+  cloud: boolean;
 }
 
 export interface HookStatus {

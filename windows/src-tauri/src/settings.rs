@@ -20,10 +20,25 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Who answers the chat: "anthropic" or "ollama" (models on the user's machine).
+    /// Defaulted so a settings.json written before this field existed still loads.
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Where Ollama listens. Only read when provider is "ollama".
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_provider() -> String {
+    crate::ollama::PROVIDER_ANTHROPIC.to_string()
+}
+
+fn default_base_url() -> String {
+    crate::ollama::DEFAULT_BASE_URL.to_string()
 }
 
 impl Default for Settings {
@@ -43,6 +58,8 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            provider: default_provider(),
+            base_url: default_base_url(),
         }
     }
 }

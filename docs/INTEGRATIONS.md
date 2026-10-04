@@ -124,6 +124,17 @@ Permissions : Enregistrement de l'écran (capture) et Automatisation (navigateur
 - Erreur réseau ou clé invalide : état `error`, vue `note` avec la raison en une phrase et « Ouvre les réglages pour vérifier la clé ».
 - Micro (bouton du champ) : dictée `SFSpeechRecognizer` en `fr-FR`, sur l'appareil si possible. Optionnel (M9). Si la permission est refusée, masquer le bouton.
 
+### 5.1 Provider local : Ollama (Windows)
+
+- Choix du provider et du modèle dans les réglages : `Provider` = `Claude (Anthropic API)` ou `Ollama — local models`. Le champ `Model` dépend du provider ; l'historique de conversation est distinct pour les deux.
+- **Aucune clé** pour Ollama : rien n'est écrit dans le Credential Manager, et rien ne sort de la machine tant que l'adresse est `127.0.0.1`.
+- Adresse par défaut `http://127.0.0.1:11434`, modifiable (Ollama distant, autre port). `Detect models` appelle `GET {adresse}/api/tags` et remplit la liste ; timeout 4 s pour ne pas figer la fenêtre si le daemon est éteint.
+- `POST {adresse}/api/chat`, corps `{ model, system, messages, stream: false, options: { num_ctx: 16384 } }`. Timeout 180 s : un modèle local se charge en mémoire au premier appel.
+- Message système : même personnage que Claude (Mochi, langue de l'utilisateur, pas de markdown), **sans** mentionner la recherche web — un modèle local n'a pas d'outil ici et ne doit pas prétendre le contraire.
+- Contexte : texte et code inlinés (plafond 200 Ko comme chez Claude), images en base64 dans `images`, PDF non supporté (seul le nom arrive au modèle). Contexte fenêtre = texte.
+- Les variantes `-cloud` sont marquées « cloud » dans la liste : elles tournent chez Ollama, pas en local.
+- Erreurs : daemon injoignable → « Cannot reach Ollama at … Is it running? » ; modèle absent → le message du daemon (« model not found, try pulling it first ») ; les deux atterrissent dans la vue `note` comme les autres.
+
 ---
 
 ## 6. Mail (app Mail du Mac)

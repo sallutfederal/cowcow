@@ -6,6 +6,7 @@ mod hooks;
 mod integrations;
 mod island;
 mod log;
+mod ollama;
 mod pipe;
 mod secrets;
 mod settings;
@@ -245,16 +246,33 @@ fn approval_decline(app: AppHandle, request_id: String) {
 async fn chat_send(
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
+    local: State<'_, ollama::LocalChat>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
+    let (provider, model, base_url) = {
+        let current = shared.settings.lock().unwrap();
+        (current.provider.clone(), current.model.clone(), current.base_url.clone())
+    };
+
+    if provider == ollama::PROVIDER_OLLAMA {
+        return ollama::send(&local, &base_url, &model, query, context).await;
+    }
     claude::send(&chat, &model, query, context).await
 }
 
 #[tauri::command]
-fn chat_reset(chat: State<Chat>) {
+fn chat_reset(chat: State<'_, Chat>, local: State<'_, ollama::LocalChat>) {
     chat.reset();
+    local.reset();
+}
+
+/// The models the local Ollama daemon has. Called from the settings window only,
+/// so a daemon that is not running costs nothing while the island is hidden.
+#[tauri::command]
+async fn ollama_models(shared: State<'_, Shared>) -> Result<Vec<ollama::LocalModel>, String> {
+    let base_url = shared.settings.lock().unwrap().base_url.clone();
+    ollama::models(&base_url).await
 }
 
 /// Copies a dropped file into the inbox and reports its name back.
@@ -380,6 +398,7 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
+        .manage(ollama::LocalChat::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
@@ -399,6 +418,7 @@ pub fn run() {
             log_line,
             chat_send,
             chat_reset,
+            ollama_models,
             ingest_file,
             secret_present,
             secret_set,

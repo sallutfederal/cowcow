@@ -3,8 +3,14 @@
 // integrations land here too in a later stage.
 
 import "./settings.css";
-import { Bridge, onEvent, type HookStatus } from "../core/bridge";
-import { DEFAULT_SETTINGS, type Settings } from "../core/state";
+import { Bridge, onEvent, type HookStatus, type LocalModel } from "../core/bridge";
+import {
+  CLAUDE_MODELS,
+  DEFAULT_SETTINGS,
+  OLLAMA_DEFAULT_BASE_URL,
+  type Provider,
+  type Settings,
+} from "../core/state";
 import { h, clear } from "../views/dom";
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
@@ -171,15 +177,52 @@ function claudeSection(status: HookStatus): HTMLElement {
   return section;
 }
 
-// ── Claude API section ────────────────────────────────────────────────────────
+// ── Model section (Claude, or a model running on this machine) ────────────────
 
-const MODELS: [string, string][] = [
-  ["claude-opus-5", "Claude Opus 5"],
-  ["claude-sonnet-5", "Claude Sonnet 5"],
-  ["claude-haiku-4-5", "Claude Haiku 4.5"],
-];
+function modelLabel(model: LocalModel): string {
+  const bits: string[] = [];
+  if (model.parameterSize) bits.push(model.parameterSize);
+  if (model.family) bits.push(model.family);
+  const info = bits.length ? ` — ${bits.join(" ")}` : "";
+  return `${model.name}${info}${model.cloud ? " (cloud)" : ""}`;
+}
 
-function apiSection(hasKey: boolean): HTMLElement {
+function claudeModelSelect(): HTMLSelectElement {
+  const select = h("select", {}) as HTMLSelectElement;
+  for (const [id, label] of CLAUDE_MODELS) select.append(h("option", { value: id, text: label }));
+  if (!CLAUDE_MODELS.some(([id]) => id === settings.model)) {
+    select.append(h("option", { value: settings.model, text: settings.model }));
+  }
+  select.value = settings.model;
+  return select;
+}
+
+function modelSection(hasKey: boolean): HTMLElement {
+  const feedback = h("div", {});
+  const rows = h("div", {});
+
+  const provider = h("select", {}) as HTMLSelectElement;
+  provider.append(h("option", { value: "anthropic", text: "Claude (Anthropic API)" }));
+  provider.append(h("option", { value: "ollama", text: "Ollama — local models" }));
+  provider.value = settings.provider;
+  provider.addEventListener("change", () => {
+    const next = provider.value as Provider;
+    settings.provider = next;
+    clear(feedback);
+    // The model list is provider-specific: never keep a Claude model id around
+    // as an Ollama model name (or the other way round).
+    if (next === "ollama" && CLAUDE_MODELS.some(([id]) => id === settings.model)) {
+      settings.model = "";
+    }
+    if (next === "anthropic" && !CLAUDE_MODELS.some(([id]) => id === settings.model)) {
+      settings.model = CLAUDE_MODELS[0][0];
+    }
+    render();
+    void save();
+  });
+
+  // ── Claude rows: key in the Credential Manager + the model list ──────────────
+
   const dot = statusDot(hasKey);
   const state = h("span", { class: "hint", text: hasKey ? "Key saved in the Windows Credential Manager." : "No key yet — the chat needs one." });
 
@@ -193,9 +236,8 @@ function apiSection(hasKey: boolean): HTMLElement {
 
   const saveBtn = h("button", { class: "primary", text: "Save key" });
   const clearBtn = h("button", { class: "danger", text: "Remove" });
-  const feedback = h("div", {});
 
-  async function refresh() {
+  async function refreshKey() {
     const present = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
     dot.style.background = present ? "#22c55e" : "#f4505e";
     state.textContent = present
@@ -213,7 +255,7 @@ function apiSection(hasKey: boolean): HTMLElement {
       await Bridge.secretSet("anthropic-api-key", value);
       field.value = "";
       feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
-      await refresh();
+      await refreshKey();
     } catch (err) {
       feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
     }
@@ -224,32 +266,124 @@ function apiSection(hasKey: boolean): HTMLElement {
     try {
       await Bridge.secretClear("anthropic-api-key");
       feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
-      await refresh();
+      await refreshKey();
     } catch (err) {
       feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
     }
   });
 
-  const model = h("select", {}) as HTMLSelectElement;
-  for (const [id, label] of MODELS) model.append(h("option", { value: id, text: label }));
-  if (!MODELS.some(([id]) => id === settings.model)) {
-    model.append(h("option", { value: settings.model, text: settings.model }));
-  }
-  model.value = settings.model;
-  model.addEventListener("change", () => {
-    settings.model = model.value;
+  const claudeModel = claudeModelSelect();
+  claudeModel.addEventListener("change", () => {
+    settings.model = claudeModel.value;
     void save();
   });
 
-  clearBtn.style.display = hasKey ? "" : "none";
+  // ── Ollama rows: address + the models the daemon actually has ───────────────
+
+  const baseUrl = h("input", {
+    type: "text",
+    placeholder: OLLAMA_DEFAULT_BASE_URL,
+    value: settings.baseUrl || OLLAMA_DEFAULT_BASE_URL,
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  baseUrl.addEventListener("change", () => {
+    settings.baseUrl = baseUrl.value.trim() || OLLAMA_DEFAULT_BASE_URL;
+    baseUrl.value = settings.baseUrl;
+    void save();
+  });
+
+  const detectBtn = h("button", { text: "Detect models" });
+  const modelInput = h("input", {
+    type: "text",
+    list: "ollama-models",
+    placeholder: "llama3.2:latest",
+    value: settings.model,
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  const datalist = h("datalist", { id: "ollama-models" });
+  modelInput.addEventListener("change", () => {
+    settings.model = modelInput.value.trim();
+    void save();
+  });
+
+  detectBtn.addEventListener("click", async () => {
+    clear(feedback);
+    // The address is saved first so Rust reads what the user just typed.
+    settings.baseUrl = baseUrl.value.trim() || OLLAMA_DEFAULT_BASE_URL;
+    baseUrl.value = settings.baseUrl;
+    detectBtn.disabled = true;
+    detectBtn.textContent = "Detecting…";
+    await save();
+    try {
+      const models = await Bridge.ollamaModels();
+      clear(datalist);
+      for (const model of models) {
+        datalist.append(h("option", { value: model.name, label: modelLabel(model) }));
+      }
+      // Nothing picked yet and the daemon has models: start on the first one
+      // that actually runs on this machine.
+      const local = models.find((m) => !m.cloud);
+      if (!settings.model && local) {
+        settings.model = local.name;
+        modelInput.value = local.name;
+        await save();
+      }
+      feedback.append(
+        h("div", {
+          class: models.length ? "notice ok" : "notice err",
+          text: models.length
+            ? `${models.length} model${models.length > 1 ? "s" : ""} found. Pick one above.`
+            : "Ollama answered, but has no model yet. Run: ollama pull llama3.2",
+        }),
+      );
+    } catch (err) {
+      clear(datalist);
+      feedback.append(
+        h("div", {
+          class: "notice err",
+          text: String(err).replace(/^Error:\s*/, "Could not reach Ollama: "),
+        }),
+      );
+    } finally {
+      detectBtn.disabled = false;
+      detectBtn.textContent = "Detect models";
+    }
+  });
+
+  function render() {
+    clear(rows);
+    if (settings.provider === "ollama") {
+      rows.append(
+        h("div", { class: "row" }, h("label", { text: "Address" }), baseUrl, detectBtn),
+        h("div", { class: "row" }, h("label", { text: "Model" }), modelInput, datalist),
+        h("div", {
+          class: "hint",
+          text: "No key needed — Ollama runs on this computer. Start it from the tray, then pull a model with: ollama pull llama3.2",
+        }),
+      );
+      clearBtn.style.display = "none";
+      return;
+    }
+    rows.append(
+      h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
+      h("div", { class: "row" }, h("label", { text: "Model" }), claudeModel),
+      state,
+    );
+    clearBtn.style.display = hasKey ? "" : "none";
+  }
+
+  render();
 
   return h(
     "section",
     {},
-    h("h2", {}, dot, h("span", { text: "Claude" })),
-    state,
-    h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
-    h("div", { class: "row" }, h("label", { text: "Model" }), model),
+    h("h2", {}, dot, h("span", { text: "Model" })),
+    h("div", { class: "row" }, h("label", { text: "Provider" }), provider),
+    rows,
     feedback,
   );
 }
@@ -442,7 +576,7 @@ async function main() {
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
-    apiSection(hasKey),
+    modelSection(hasKey),
     integrationsSection(present),
     generalSection(),
     h("div", {

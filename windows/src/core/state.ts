@@ -90,9 +90,24 @@ export interface Settings {
   screen: "primary" | "cursor";
   autostart: boolean;
   hooksInstalled: boolean;
-  /** Claude model used by the chat. */
+  /** Model used by the chat, whatever the provider. */
   model: string;
+  /** Who answers the chat: "anthropic" or "ollama" (models on this machine). */
+  provider: Provider;
+  /** Where Ollama listens. Only read when provider is "ollama". */
+  baseUrl: string;
 }
+
+export type Provider = "anthropic" | "ollama";
+
+/** What the settings window shows for each provider: key needed? model list? */
+export const CLAUDE_MODELS: [string, string][] = [
+  ["claude-opus-5", "Claude Opus 5"],
+  ["claude-sonnet-5", "Claude Sonnet 5"],
+  ["claude-haiku-4-5", "Claude Haiku 4.5"],
+];
+
+export const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 
 export const DEFAULT_SETTINGS: Settings = {
   soundEnabled: true,
@@ -106,6 +121,8 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  provider: "anthropic",
+  baseUrl: OLLAMA_DEFAULT_BASE_URL,
 };
 
 type Listener = () => void;

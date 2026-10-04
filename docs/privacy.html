@@ -28,6 +28,7 @@
 <p>Coucou only talks to the services you configure, directly from your Mac, using your own keys. Those services process your data under their own privacy policies:</p>
 <ul>
 <li><b>Anthropic (Claude API)</b> — when you chat with Claude or ask about a file or a window, the text you type, the file content and/or the window context you chose are sent to Anthropic. <a href="https://www.anthropic.com/legal/privacy">Anthropic privacy policy</a>.</li>
+<li><b>Ollama (optional)</b> — if you pick a local model as your provider, the chat runs on your own computer through your own Ollama daemon and nothing leaves it. No API key is stored. Pointing the address somewhere other than <code>127.0.0.1</code> sends the same data to that machine instead — and <code>-cloud</code> models run on Ollama's servers, not on yours.</li>
 <li><b>Stripe, GitHub, Vercel, Resend, Notion, Cal.com, n8n</b> — Coucou reads data from your own accounts (payments, repositories, deployments, emails, pages, bookings, workflow runs) to display them. Coucou only reads from them.</li>
 </ul>
 <p>We have no access to these requests or their responses.</p>

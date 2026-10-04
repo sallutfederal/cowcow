@@ -349,7 +349,11 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                     && y >= 0.0
                     && y <= size.1;
 
-                let accept = on_island || dragging;
+                // Collapsed, the window is the invisible wake strip: it has to take
+                // the mouse whatever the cursor says, otherwise a tick still in
+                // flight when the island parks leaves WS_EX_TRANSPARENT set and the
+                // strip can never be hovered again — the island is then lost.
+                let accept = on_island || dragging || gate.collapsed.load(Ordering::Relaxed);
                 if gate.ignoring.load(Ordering::Relaxed) == accept {
                     gate.ignoring.store(!accept, Ordering::Relaxed);
                     let _ = win.set_ignore_cursor_events(!accept);

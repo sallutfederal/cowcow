@@ -27,6 +27,12 @@ You have web search access and can help with absolutely anything — research, c
 Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
 No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
 
+/// The same character for every other provider. No web search claim: those APIs
+/// give us no tool here, and it should not pretend otherwise.
+pub(crate) const LOCAL_SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
+Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
+No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
+
 #[derive(Default)]
 pub struct Chat {
     /// Full multi-turn history, including tool_use / tool_result blocks.

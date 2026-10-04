@@ -98,6 +98,9 @@ Centre vertical du bonhomme : 36 + (hauteur − 46) / 2, sauf `result` (y = 86).
 
 | Agent | Couleur |
 |---|---|
+| Claude Code | `#F5F6F8` |
+| Codex | `#10A37F` |
+| Kimi Code | `#22D3EE` |
 | Korus | `#FF6B5B` |
 | SBE Hub | `#2DD4A7` |
 | Morning AI Brief (n8n) | `#F7B32B` |

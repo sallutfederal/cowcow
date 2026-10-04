@@ -5,7 +5,7 @@
 import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
 import { Ticker } from "./ticker";
-import { State, type AgentTask } from "../core/state";
+import { State, AGENT_TASK_IDS, type AgentSource, type AgentTask } from "../core/state";
 import { washRGBA, type IslandViewName, type Wash } from "../core/layout";
 import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
@@ -172,10 +172,12 @@ function buildOverview(actions: ViewActions): ViewHost {
         mode = null;
       }
 
-      // VS Code with a live Claude Code session keeps the ticker; every other
+      // VS Code with a live agent session keeps the ticker; every other
       // pill shows its own card, exactly like IntegrationCardView.
       const sessionActive =
-        task?.id === "integration_claude" && (task.state !== "idle" || task.steps.length > 0);
+        task != null &&
+        Object.values(AGENT_TASK_IDS).includes(task.id as never) &&
+        (task.state !== "idle" || task.steps.length > 0);
 
       if (task && sessionActive) {
         if (mode !== "ticker") {
@@ -188,8 +190,12 @@ function buildOverview(actions: ViewActions): ViewHost {
         who.append(
           dot(task.color, 7),
           h("span", { class: "name", text: task.name }),
-          h("span", { class: "tool", text: task.source === "claudeCode" ? "Claude Code" : "n8n" }),
+          // The agent, then where it is working. Never the other way round.
+          h("span", { class: "tool", text: SOURCE_LABELS[task.source] ?? "n8n" }),
         );
+        if (task.sessionProject) {
+          who.append(h("span", { class: "tool", text: task.sessionProject }));
+        }
         if (task.steps.length > 1) {
           who.append(h("span", {
             class: "count",
@@ -214,7 +220,16 @@ function buildOverview(actions: ViewActions): ViewHost {
 
       jump.style.display = detailOpen ? "none" : "";
 
-      const others = State.otherTasks.slice(0, 4);
+      // Every coding agent gets a pill of its own — there are five of them now — and
+// the opt-in integrations keep a small cap so the column never grows without
+// bound. An agent is never dropped: a pill that cannot be seen is an agent that
+// does not exist as far as the user is concerned.
+const agentIds = new Set<string>(Object.values(AGENT_TASK_IDS));
+const all = State.otherTasks;
+const others = [
+  ...all.filter((t) => agentIds.has(t.id)),
+  ...all.filter((t) => !agentIds.has(t.id)).slice(0, 2),
+];
       const pillKey = others.map((t) => `${t.id}:${t.pillBadge ?? ""}`).join("|");
       if (pillKey !== pillIds) {
         pillIds = pillKey;
@@ -226,8 +241,17 @@ function buildOverview(actions: ViewActions): ViewHost {
   };
 }
 
+/** What the ticker calls each kind of agent. */
+const SOURCE_LABELS: Record<AgentSource, string> = {
+  claudeCode: "Claude Code",
+  codex: "Codex",
+  kimi: "Kimi Code",
+  n8n: "n8n",
+};
+
 function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
-  const label = task.id === "integration_claude" ? "VS Code" : task.name;
+  // The pill is the agent. Not the editor it happens to run in, not the folder.
+  const label = task.name;
   const canvas = createMiniBot(task, 24);
   const pill = h(
     "div",
@@ -298,7 +322,12 @@ function buildApproval(actions: ViewActions): ViewHost {
     el,
     sync() {
       clear(who);
-      who.append(agentWho(State.focusTask, "needs permission"));
+      // The asking agent, not whatever pill happens to be focused: a Codex
+      // request can land while Claude's card is on screen.
+      const asking = State.pendingApproval
+        ? State.tasks.find((t) => t.id === AGENT_TASK_IDS[State.pendingApproval!.agent]) ?? null
+        : null;
+      who.append(agentWho(asking, "needs permission"));
       // The whole point of approving here rather than in the terminal: this line
       // is the command, the file path or the URL being authorised, not just the
       // name of the tool asking.

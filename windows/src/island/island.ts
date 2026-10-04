@@ -10,7 +10,7 @@ import {
   type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound } from "../core/sound";
-import { State } from "../core/state";
+import { AGENT_TASK_IDS, State } from "../core/state";
 import { BotEngine, hexToRGB } from "../mochi/engine";
 import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
@@ -143,8 +143,10 @@ export class Island {
         State.pendingApproval = null;
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
-        State.setPillBadge("integration_claude", null);
+        // Whichever agent asked is the one that goes back to work.
+        const asked = AGENT_TASK_IDS[req.agent];
+        State.updateTask(asked, "working");
+        State.setPillBadge(asked, null);
         this.setView(State.defaultView());
       },
       toggleSound: () => {

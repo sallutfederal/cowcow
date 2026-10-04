@@ -1,29 +1,31 @@
-//! coucou-hook — the relay Claude Code runs on every hook event.
+//! coucou-hook — the relay Claude Code, Codex and Kimi Code run on every hook event.
 //!
 //! Reads the hook JSON on stdin, adds a little terminal context, and hands it to
 //! Coucou over the named pipe `\\.\pipe\coucou-<sid>`.
 //!
-//! Hard rule (docs/CLAUDE.md): **never block Claude Code.**
+//! Hard rule (docs/CLAUDE.md): **never block the agent.**
 //! * If the pipe does not exist — Coucou is closed — we exit 0 immediately with
 //!   nothing on stdout, and the session carries on untouched.
 //! * Every step runs under a deadline enforced by the main thread, so a pipe that
 //!   accepts the connection and then stops reading cannot wedge the session
 //!   either: we abandon the worker and exit.
-//! * Only `PermissionRequest` waits for an answer, because approving from the
-//!   island is the whole point. No answer means empty stdout, and Claude Code
-//!   asks in the terminal exactly as if Coucou were not installed.
+//! * Only a permission request waits for an answer, because approving from the
+//!   island is the whole point. No answer means empty stdout, and the agent asks
+//!   in its own UI exactly as if Coucou were not installed.
 //!
-//! Usage: `coucou-hook <EventName>` (the name is also read from the JSON).
+//! Usage: `coucou-hook [provider] <EventName>` — the name is also read from the
+//! JSON. `provider` is one of `claude` (the default, so existing installations
+//! keep working), `codex` or `kimi`.
 
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Budget for getting a pipe connection. Beyond this Claude Code wins, always.
+/// Budget for getting a pipe connection. Beyond this the agent wins, always.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 /// Whole-run budget for an event nobody waits on: connect and write, no more.
 const FIRE_AND_FORGET_BUDGET: Duration = Duration::from_secs(2);
-/// How long a permission prompt may stay on screen before the terminal takes over.
+/// How long a permission prompt may stay on screen before the agent takes over.
 const DECISION_BUDGET: Duration = Duration::from_secs(110);
 
 /// `ERROR_PIPE_BUSY` — every instance is serving someone else right now. This is
@@ -71,8 +73,48 @@ fn connect() -> Option<std::fs::File> {
     }
 }
 
+
+
+/// Which agent is calling. Kimi Code does not speak Claude Code's dialect, so
+/// this still decides the shape of a decision.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Provider {
+    Claude,
+    Codex,
+    Kimi,
+}
+
+impl Provider {
+    fn parse(arg: &str) -> Option<Self> {
+        match arg.to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "kimi" | "kimi-code" | "kimicode" => Some(Self::Kimi),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Kimi => "kimi",
+        }
+    }
+}
+
 fn main() {
-    let Some((payload, event)) = read_event() else { std::process::exit(0) };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Two arguments means a provider was named; one means the old Claude form.
+    let (provider, arg_event) = match args.as_slice() {
+        [only] => (Provider::Claude, only.clone()),
+        [first, second, ..] => (Provider::parse(first).unwrap_or(Provider::Claude), second.clone()),
+        [] => (Provider::Claude, String::new()),
+    };
+
+    let Some((payload, event)) = read_event(provider, arg_event) else {
+        std::process::exit(0);
+    };
 
     let waits_for_answer = event == "PermissionRequest";
     let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
@@ -87,34 +129,45 @@ fn main() {
     });
 
     if let Ok(Some(decision)) = rx.recv_timeout(budget) {
-        if let Some(json) = decision_json(&decision) {
+        if let Some(json) = decision_json(provider, &decision) {
             let mut out = std::io::stdout();
             let _ = writeln!(out, "{json}");
             let _ = out.flush();
         }
     }
-    // Nothing printed: Claude Code asks in the terminal, as if we were not here.
+    // Nothing printed: the agent asks in its own UI, as if we were not here.
     std::process::exit(0);
 }
 
-/// The documented PermissionRequest output. Anything we do not recognise prints
-/// nothing at all rather than guessing — silence is the safe answer.
-/// See https://code.claude.com/docs/en/hooks
-fn decision_json(decision: &str) -> Option<String> {
-    let behavior = match decision.trim() {
-        // "always" still answers a plain allow; remembering it is the island's
-        // business, not Claude Code's.
-        "allow" | "always" => r#"{"behavior":"allow"}"#.to_string(),
-        "deny" => r#"{"behavior":"deny","message":"Denied from Coucou"}"#.to_string(),
-        _ => return None,
-    };
-    Some(format!(
-        r#"{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{behavior}}}}}"#
-    ))
+/// The documented permission output for the agent that called.
+///
+/// Claude Code and Codex share the `hookSpecificOutput.decision.behavior` shape.
+/// Kimi Code gates on the exit code (2 blocks), never on stdout JSON, and cannot
+/// ask the user through a hook — so there is nothing for us to answer there.
+/// Anything we do not recognise prints nothing rather than guessing: silence is
+/// the safe answer.
+fn decision_json(provider: Provider, decision: &str) -> Option<String> {
+    let decision = decision.trim();
+    match provider {
+        Provider::Claude | Provider::Codex => {
+            let behavior = match decision {
+                // "always" still answers a plain allow; remembering it is the
+                // island's business, not the agent's.
+                "allow" | "always" => r#"{"behavior":"allow"}"#,
+                "deny" => r#"{"behavior":"deny","message":"Denied from Coucou"}"#,
+                _ => return None,
+            };
+            Some(format!(
+                r#"{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{behavior}}}}}"#
+            ))
+        }
+        // Kimi is like an absent hook: silence leaves its own prompt in place.
+        Provider::Kimi => None,
+    }
 }
 
-/// Reads stdin and returns the payload to forward plus the event name.
-fn read_event() -> Option<(String, String)> {
+/// Reads stdin and returns the payload to forward plus the island event name.
+fn read_event(provider: Provider, arg_event: String) -> Option<(String, String)> {
     let mut raw = Vec::new();
     if std::io::stdin().read_to_end(&mut raw).is_err() || raw.is_empty() {
         return None;
@@ -127,16 +180,17 @@ fn read_event() -> Option<(String, String)> {
     let mut payload = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
     let map = payload.as_object_mut()?;
 
-    // The event name is passed as argv[1] by the hook command; the JSON usually
+    // The event name is passed as argv by the hook command; the JSON usually
     // carries it too. Trust argv when the JSON is missing it.
-    let arg_event = std::env::args().nth(1).unwrap_or_default();
-    let event = map
+    let raw_event = map
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
+    let event = raw_event;
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
+    map.insert("source".into(), serde_json::Value::String(provider.id().to_string()));
 
     for field in DROPPED_FIELDS {
         map.remove(*field);
@@ -234,25 +288,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decision_json_matches_the_documented_shape() {
-        assert_eq!(
-            decision_json("allow").unwrap(),
-            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
-        );
-        assert_eq!(
-            decision_json("deny").unwrap(),
-            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from Coucou"}}}"#
-        );
-        // "always" is an island concept; Claude Code just gets an allow.
-        assert!(decision_json("always").unwrap().contains(r#""behavior":"allow""#));
+    fn provider_is_optional_and_recognised() {
+        assert_eq!(Provider::parse("claude"), Some(Provider::Claude));
+        assert_eq!(Provider::parse("Claude-Code"), Some(Provider::Claude));
+        assert_eq!(Provider::parse("codex"), Some(Provider::Codex));
+        assert_eq!(Provider::parse("kimi"), Some(Provider::Kimi));
+        assert_eq!(Provider::parse("kimi-code"), Some(Provider::Kimi));
+        assert_eq!(Provider::parse("Stop"), None);
     }
 
+
     #[test]
-    fn anything_unrecognised_prints_nothing() {
-        assert!(decision_json("").is_none());
-        assert!(decision_json("maybe").is_none());
-        // The shape the app used to send must not be mistaken for a decision.
-        assert!(decision_json(r#"{"permissionDecision":"allow"}"#).is_none());
+    fn claude_and_codex_share_the_documented_decision_shape() {
+        let expected_allow =
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+        let expected_deny = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from Coucou"}}}"#;
+        assert_eq!(decision_json(Provider::Claude, "allow").unwrap(), expected_allow);
+        assert_eq!(decision_json(Provider::Codex, "allow").unwrap(), expected_allow);
+        assert_eq!(decision_json(Provider::Claude, "deny").unwrap(), expected_deny);
+        assert_eq!(decision_json(Provider::Codex, "deny").unwrap(), expected_deny);
+        // "always" is an island concept; the agent just gets an allow.
+        assert_eq!(decision_json(Provider::Codex, "always").unwrap(), expected_allow);
     }
 
     #[test]

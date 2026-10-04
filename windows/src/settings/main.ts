@@ -5,9 +5,13 @@
 import "./settings.css";
 import { Bridge, onEvent, type HookStatus, type LocalModel } from "../core/bridge";
 import {
-  CLAUDE_MODELS,
   DEFAULT_SETTINGS,
   OLLAMA_DEFAULT_BASE_URL,
+  PROVIDER_INFO,
+  PROVIDER_LABELS,
+  PROVIDER_MODELS,
+  apiKeyForProvider,
+  type AgentId,
   type Provider,
   type Settings,
 } from "../core/state";
@@ -47,25 +51,38 @@ function renderDiff(text: string): HTMLElement {
   return box;
 }
 
-// ── Claude Code section ───────────────────────────────────────────────────────
+// ── Coding agents (Claude Code, Codex, Cursor) ────────────────────────────────
 
-function claudeSection(status: HookStatus): HTMLElement {
+/** What each agent gets out of being hooked, in the user's words. */
+const AGENT_NOTES: Record<AgentId, { blurb: string; after: string }> = {
+  claude: {
+    blurb: "Tool calls, questions and permission requests show up in the island, and you can answer them there.",
+    after: "Open a new Claude Code session to pick the hooks up.",
+  },
+  codex: {
+    blurb: "Codex speaks Claude Code's hook protocol, so turns, tools and permission requests land in the island — and you can approve from it.",
+    after: "Open a new Codex session to pick the hooks up. If Codex asks you to trust them, say yes: run /hooks in Codex.",
+  },
+  kimi: {
+    blurb: "Prompts, tool calls, subagents and the end of a turn show up in the island, one pill of their own.",
+    after: "Open a new Kimi session to pick the hooks up. Kimi answers its own approval prompts, so those stay in Kimi.",
+  },
+};
+
+function agentSection(agent: AgentId, status: HookStatus): HTMLElement {
+  const notes = AGENT_NOTES[agent];
   const body = h("div", { style: "display:flex;flex-direction:column;gap:12px" });
-  const section = h(
-    "section",
-    {},
-    h("h2", {}, statusDot(status.installed), h("span", { text: "Claude Code" })),
-    body,
-  );
+  const head = () => h("h2", {}, statusDot(status.installed), h("span", { text: status.name }));
+  const section = h("section", {}, head(), body);
 
   const rebuild = async () => {
-    const fresh = await Bridge.hooksStatus();
+    const fresh = (await Bridge.hooksStatus())?.find((s) => s.provider === agent);
     if (fresh) Object.assign(status, fresh);
     clear(body);
     draw();
-    const head = section.querySelector("h2")!;
-    clear(head);
-    head.append(statusDot(status.installed), h("span", { text: "Claude Code" }));
+    const title = section.querySelector("h2")!;
+    clear(title);
+    title.append(statusDot(status.installed), h("span", { text: status.name }));
   };
 
   function draw() {
@@ -73,11 +90,11 @@ function claudeSection(status: HookStatus): HTMLElement {
       h("div", {
         class: "hint",
         text: status.installed
-          ? "Coucou is hooked into your Claude Code sessions. Tool calls, questions and permission requests show up in the island, and you can answer them there."
-          : "Install the hooks to see your Claude Code sessions in the island and approve permissions without leaving what you are doing.",
+          ? `Coucou is hooked into your ${status.name} sessions. ${notes.blurb}`
+          : `Install the hooks to see your ${status.name} sessions in the island. ${notes.blurb}`,
       }),
       h("div", { class: "row" },
-        h("label", { text: "settings.json" }),
+        h("label", { text: "Config" }),
         h("span", { class: "path", text: status.settingsPath }),
       ),
       h("div", { class: "row" },
@@ -98,10 +115,10 @@ function claudeSection(status: HookStatus): HTMLElement {
     const install = h("button", {
       class: "primary",
       text: status.installed ? "Reinstall hooks…" : "Install hooks…",
-      onclick: () => showPreview(true),
+      onclick: () => void showPreview(true),
     });
     // Writing hook commands that point at a relay which isn't there would give
-    // every Claude Code session a broken hook and nothing to show for it.
+    // every session a broken hook and nothing to show for it.
     if (!status.hookReady) {
       install.disabled = true;
       install.title = "The relay isn't installed yet.";
@@ -111,7 +128,7 @@ function claudeSection(status: HookStatus): HTMLElement {
       actions.append(h("button", {
         class: "danger",
         text: "Uninstall hooks…",
-        onclick: () => showPreview(false),
+        onclick: () => void showPreview(false),
       }));
     }
     body.append(actions);
@@ -120,10 +137,10 @@ function claudeSection(status: HookStatus): HTMLElement {
   async function showPreview(install: boolean) {
     let preview;
     try {
-      preview = await Bridge.hooksPreview(install);
+      preview = await Bridge.hooksPreview(agent, install);
     } catch (err) {
-      // An unreadable or invalid settings.json stops here rather than being
-      // treated as empty and written over.
+      // An unreadable or invalid config stops here rather than being treated as
+      // empty and written over.
       clear(body);
       body.append(
         h("div", { class: "notice err", text: String(err).replace(/^Error:\s*/, "") }),
@@ -140,7 +157,7 @@ function claudeSection(status: HookStatus): HTMLElement {
       h("div", {
         class: "hint",
         text: install
-          ? "This is exactly what will change in your settings.json. Your own hooks are left untouched."
+          ? `This is exactly what will change in ${preview.settingsPath}. Your own hooks are left untouched.`
           : "This removes Coucou's entries only. Your own hooks are left untouched.",
       }),
       renderDiff(preview.diff),
@@ -155,11 +172,11 @@ function claudeSection(status: HookStatus): HTMLElement {
     confirm.addEventListener("click", async () => {
       confirm.disabled = true;
       try {
-        const backup = await Bridge.hooksApply(install, preview.fingerprint);
+        const backup = await Bridge.hooksApply(agent, install, preview.fingerprint);
         clear(body);
         body.append(h("div", {
           class: "notice ok",
-          text: `Done. Previous settings saved as ${backup}. Open a new Claude Code session to pick the hooks up.`,
+          text: `Done. Previous settings saved as ${backup}. ${notes.after}`,
         }));
         window.setTimeout(() => void rebuild(), 2600);
       } catch (err) {
@@ -177,7 +194,19 @@ function claudeSection(status: HookStatus): HTMLElement {
   return section;
 }
 
-// ── Model section (Claude, or a model running on this machine) ────────────────
+function agentsSection(statuses: HookStatus[]): HTMLElement[] {
+  return (["claude", "codex", "kimi"] as AgentId[])
+    .map((agent) => statuses.find((s) => s.provider === agent))
+    .filter((s): s is HookStatus => Boolean(s))
+    .map((s) => agentSection(s.provider, s));
+}
+
+
+// ── Providers: one key, one model list each ──────────
+//
+// The key lives with the provider, so one OpenAI key is typed once and every
+// agent set to OpenAI benefits. An agent's section only says *who* answers for it
+// and with which model — never a key.
 
 function modelLabel(model: LocalModel): string {
   const bits: string[] = [];
@@ -187,73 +216,87 @@ function modelLabel(model: LocalModel): string {
   return `${model.name}${info}${model.cloud ? " (cloud)" : ""}`;
 }
 
-function claudeModelSelect(): HTMLSelectElement {
-  const select = h("select", {}) as HTMLSelectElement;
-  for (const [id, label] of CLAUDE_MODELS) select.append(h("option", { value: id, text: label }));
-  if (!CLAUDE_MODELS.some(([id]) => id === settings.model)) {
-    select.append(h("option", { value: settings.model, text: settings.model }));
-  }
-  select.value = settings.model;
-  return select;
-}
-
-function modelSection(hasKey: boolean): HTMLElement {
+/** Provider: its key, its address, and the model it defaults to. */
+function providerSection(provider: Provider, hasKey: boolean): HTMLElement {
+  const info = PROVIDER_INFO[provider];
+  const config = settings.providers[provider] ?? (settings.providers[provider] = {
+    model: "", baseUrl: "",
+  });
   const feedback = h("div", {});
-  const rows = h("div", {});
+  const dot = statusDot(hasKey && info.needsKey);
+  const keyName = apiKeyForProvider(provider);
 
-  const provider = h("select", {}) as HTMLSelectElement;
-  provider.append(h("option", { value: "anthropic", text: "Claude (Anthropic API)" }));
-  provider.append(h("option", { value: "ollama", text: "Ollama — local models" }));
-  provider.value = settings.provider;
-  provider.addEventListener("change", () => {
-    const next = provider.value as Provider;
-    settings.provider = next;
-    clear(feedback);
-    // The model list is provider-specific: never keep a Claude model id around
-    // as an Ollama model name (or the other way round).
-    if (next === "ollama" && CLAUDE_MODELS.some(([id]) => id === settings.model)) {
-      settings.model = "";
-    }
-    if (next === "anthropic" && !CLAUDE_MODELS.some(([id]) => id === settings.model)) {
-      settings.model = CLAUDE_MODELS[0][0];
-    }
-    render();
-    void save();
+  const state = h("span", {
+    class: "hint",
+    text: info.needsKey
+      ? hasKey
+        ? "Key saved in the Windows Credential Manager."
+        : info.note
+      : info.note,
   });
 
-  // ── Claude rows: key in the Credential Manager + the model list ──────────────
-
-  const dot = statusDot(hasKey);
-  const state = h("span", { class: "hint", text: hasKey ? "Key saved in the Windows Credential Manager." : "No key yet — the chat needs one." });
-
-  const field = h("input", {
+  const keyField = h("input", {
     type: "password",
-    placeholder: hasKey ? "••••••••••••  (stored)" : "sk-ant-...",
+    placeholder: hasKey ? "••••••••••••  (stored)" : info.placeholder,
     style: "flex:1 1 auto;min-width:0",
     autocomplete: "off",
     spellcheck: "false",
   }) as HTMLInputElement;
-
   const saveBtn = h("button", { class: "primary", text: "Save key" });
   const clearBtn = h("button", { class: "danger", text: "Remove" });
 
+  const modelField = h("input", {
+    type: "text",
+    list: `provider-models-${provider}`,
+    placeholder: provider === "ollama" ? "llama3.2:latest" : "model name",
+    value: config.model,
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  const datalist = h("datalist", { id: `provider-models-${provider}` });
+  for (const model of PROVIDER_MODELS[provider]) {
+    datalist.append(h("option", { value: model }));
+  }
+
+  const baseField = h("input", {
+    type: "text",
+    placeholder: info.defaultBaseUrl ?? "https://…",
+    value: config.baseUrl,
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  const detectBtn = h("button", { text: "Detect models" });
+
+  function save() {
+    config.model = modelField.value.trim();
+    config.baseUrl = baseField.value.trim();
+    void Bridge.saveSettings(settings);
+  }
+
+  modelField.addEventListener("change", save);
+  baseField.addEventListener("change", save);
+
   async function refreshKey() {
-    const present = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
+    const present = (await Bridge.secretPresent(keyName)) ?? false;
     dot.style.background = present ? "#22c55e" : "#f4505e";
-    state.textContent = present
-      ? "Key saved in the Windows Credential Manager."
-      : "No key yet — the chat needs one.";
-    field.placeholder = present ? "••••••••••••  (stored)" : "sk-ant-...";
+    state.textContent = info.needsKey
+      ? present
+        ? "Key saved in the Windows Credential Manager."
+        : info.note
+      : info.note;
+    keyField.placeholder = present ? "••••••••••••  (stored)" : info.placeholder;
     clearBtn.style.display = present ? "" : "none";
   }
 
   saveBtn.addEventListener("click", async () => {
-    const value = field.value.trim();
+    const value = keyField.value.trim();
     if (!value) return;
     clear(feedback);
     try {
-      await Bridge.secretSet("anthropic-api-key", value);
-      field.value = "";
+      await Bridge.secretSet(keyName, value);
+      keyField.value = "";
       feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
       await refreshKey();
     } catch (err) {
@@ -264,7 +307,7 @@ function modelSection(hasKey: boolean): HTMLElement {
   clearBtn.addEventListener("click", async () => {
     clear(feedback);
     try {
-      await Bridge.secretClear("anthropic-api-key");
+      await Bridge.secretClear(keyName);
       feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
       await refreshKey();
     } catch (err) {
@@ -272,120 +315,104 @@ function modelSection(hasKey: boolean): HTMLElement {
     }
   });
 
-  const claudeModel = claudeModelSelect();
-  claudeModel.addEventListener("change", () => {
-    settings.model = claudeModel.value;
-    void save();
-  });
-
-  // ── Ollama rows: address + the models the daemon actually has ───────────────
-
-  const baseUrl = h("input", {
-    type: "text",
-    placeholder: OLLAMA_DEFAULT_BASE_URL,
-    value: settings.baseUrl || OLLAMA_DEFAULT_BASE_URL,
-    style: "flex:1 1 auto;min-width:0",
-    autocomplete: "off",
-    spellcheck: "false",
-  }) as HTMLInputElement;
-  baseUrl.addEventListener("change", () => {
-    settings.baseUrl = baseUrl.value.trim() || OLLAMA_DEFAULT_BASE_URL;
-    baseUrl.value = settings.baseUrl;
-    void save();
-  });
-
-  const detectBtn = h("button", { text: "Detect models" });
-  const modelInput = h("input", {
-    type: "text",
-    list: "ollama-models",
-    placeholder: "llama3.2:latest",
-    value: settings.model,
-    style: "flex:1 1 auto;min-width:0",
-    autocomplete: "off",
-    spellcheck: "false",
-  }) as HTMLInputElement;
-  const datalist = h("datalist", { id: "ollama-models" });
-  modelInput.addEventListener("change", () => {
-    settings.model = modelInput.value.trim();
-    void save();
-  });
-
   detectBtn.addEventListener("click", async () => {
     clear(feedback);
-    // The address is saved first so Rust reads what the user just typed.
-    settings.baseUrl = baseUrl.value.trim() || OLLAMA_DEFAULT_BASE_URL;
-    baseUrl.value = settings.baseUrl;
+    baseField.value = baseField.value.trim() || OLLAMA_DEFAULT_BASE_URL;
+    config.baseUrl = baseField.value;
     detectBtn.disabled = true;
     detectBtn.textContent = "Detecting…";
-    await save();
+    save();
     try {
       const models = await Bridge.ollamaModels();
       clear(datalist);
       for (const model of models) {
         datalist.append(h("option", { value: model.name, label: modelLabel(model) }));
       }
-      // Nothing picked yet and the daemon has models: start on the first one
-      // that actually runs on this machine.
       const local = models.find((m) => !m.cloud);
-      if (!settings.model && local) {
-        settings.model = local.name;
-        modelInput.value = local.name;
-        await save();
+      if (!config.model && local) {
+        config.model = local.name;
+        modelField.value = local.name;
+        save();
       }
-      feedback.append(
-        h("div", {
-          class: models.length ? "notice ok" : "notice err",
-          text: models.length
-            ? `${models.length} model${models.length > 1 ? "s" : ""} found. Pick one above.`
-            : "Ollama answered, but has no model yet. Run: ollama pull llama3.2",
-        }),
-      );
+      feedback.append(h("div", {
+        class: models.length ? "notice ok" : "notice err",
+        text: models.length
+          ? `${models.length} model${models.length > 1 ? "s" : ""} found. Pick one above.`
+          : "Ollama answered, but has no model yet. Run: ollama pull llama3.2",
+      }));
     } catch (err) {
-      clear(datalist);
-      feedback.append(
-        h("div", {
-          class: "notice err",
-          text: String(err).replace(/^Error:\s*/, "Could not reach Ollama: "),
-        }),
-      );
+      feedback.append(h("div", {
+        class: "notice err",
+        text: String(err).replace(/^Error:\s*/, "Could not reach Ollama: "),
+      }));
     } finally {
       detectBtn.disabled = false;
       detectBtn.textContent = "Detect models";
     }
   });
 
-  function render() {
-    clear(rows);
-    if (settings.provider === "ollama") {
-      rows.append(
-        h("div", { class: "row" }, h("label", { text: "Address" }), baseUrl, detectBtn),
-        h("div", { class: "row" }, h("label", { text: "Model" }), modelInput, datalist),
-        h("div", {
-          class: "hint",
-          text: "No key needed — Ollama runs on this computer. Start it from the tray, then pull a model with: ollama pull llama3.2",
-        }),
-      );
-      clearBtn.style.display = "none";
-      return;
-    }
-    rows.append(
-      h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
-      h("div", { class: "row" }, h("label", { text: "Model" }), claudeModel),
+  const rows: HTMLElement[] = [];
+  if (info.needsKey) {
+    rows.push(
+      h("div", { class: "row" }, h("label", { text: "API key" }), keyField, saveBtn, clearBtn),
       state,
     );
-    clearBtn.style.display = hasKey ? "" : "none";
+  } else {
+    rows.push(state);
+  }
+  rows.push(h("div", { class: "row" },
+    h("label", { text: "Model" }), modelField, detectBtn, datalist));
+  // The address is already configured for the hosted providers: showing it would
+  // only ask the user to confirm something Coucou already knows. Only a local
+  // daemon has an address worth changing.
+  if (info.addressEditable) {
+    rows.push(h("div", { class: "row" }, h("label", { text: "Address" }), baseField));
   }
 
-  render();
+  return h("section", {},
+    h("h2", {}, dot, h("span", { text: info.name })),
+    ...rows,
+    feedback);
+}
 
-  return h(
-    "section",
-    {},
-    h("h2", {}, dot, h("span", { text: "Model" })),
-    h("div", { class: "row" }, h("label", { text: "Provider" }), provider),
-    rows,
-    feedback,
-  );
+function providerSections(present: Record<string, boolean>): HTMLElement[] {
+  return (Object.keys(PROVIDER_INFO) as Provider[])
+    .map((provider) => providerSection(provider, present[apiKeyForProvider(provider)] ?? false));
+}
+
+/**
+ * Which provider answers the island's chat. One choice for everybody: Claude
+ * Code, Codex and Kimi Code each have an account you already pay for, and asking
+ * the same question three times was noise.
+ */
+function chatProviderPicker(): HTMLElement {
+  const row = h("div", { class: "row" });
+  const select = h("select", {}) as HTMLSelectElement;
+  for (const [value, label] of Object.entries(PROVIDER_LABELS)) {
+    select.append(h("option", { value, text: label }));
+  }
+  select.value = settings.chatProvider;
+  select.addEventListener("change", () => {
+    settings.chatProvider = select.value as Provider;
+    void save();
+    note.textContent = noteFor(settings.chatProvider);
+  });
+
+  const note = h("div", {
+    class: "hint",
+    text: noteFor(settings.chatProvider),
+  });
+
+  row.append(h("label", { text: "Chat answers with" }), select);
+  return h("section", {}, h("h2", {}, statusDot(true), h("span", { text: "Chat" })), row, note);
+}
+
+
+function noteFor(provider: Provider): string {
+  const config = settings.providers[provider];
+  const model = config?.model || PROVIDER_INFO[provider].models[0] || "no model yet";
+  const key = PROVIDER_INFO[provider].needsKey ? "" : " — no key needed";
+  return `The island answers with ${PROVIDER_INFO[provider].name} · ${model}${key}.`;
 }
 
 // ── Integrations section ──────────────────────────────────────────────────────
@@ -417,7 +444,6 @@ const INTEGRATIONS: IntegrationDef[] = [
   { id: "integration_calcom", name: "Cal.com", color: "#C9956A",
     fields: [{ key: "calcom-api-key", label: "API key", placeholder: "cal_…", secret: true }] },
 ];
-
 const MAX_ACTIVE = 4;
 
 function integrationsSection(present: Record<string, boolean>): HTMLElement {
@@ -553,19 +579,11 @@ function generalSection(): HTMLElement {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
-async function main() {
-  const boot = await Bridge.boot();
-  if (boot) {
-    settings = { ...settings, ...boot.settings };
-    version = boot.version;
-  }
-  const status = (await Bridge.hooksStatus()) ?? {
-    installed: false, settingsPath: "", hookPath: "", hookReady: false,
-  };
-
-  const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
+async function render() {
+  const statuses = (await Bridge.hooksStatus()) ?? [];
 
   const keys = [
+    ...(Object.keys(PROVIDER_INFO) as Provider[]).map(apiKeyForProvider),
     "stripe-api-key", "github-token", "vercel-token",
     "n8n-url", "n8n-api-key", "resend-api-key", "notion-api-key", "calcom-api-key",
   ];
@@ -575,8 +593,9 @@ async function main() {
   clear(root);
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
-    claudeSection(status),
-    modelSection(hasKey),
+    ...agentsSection(statuses),
+    chatProviderPicker(),
+    ...providerSections(present),
     integrationsSection(present),
     generalSection(),
     h("div", {
@@ -584,6 +603,16 @@ async function main() {
       text: "No telemetry. Network requests only go to the services you configure yourself.",
     }),
   );
+}
+
+async function main() {
+  const boot = await Bridge.boot();
+  if (boot) {
+    settings = { ...settings, ...boot.settings };
+    version = boot.version;
+  }
+
+  await render();
 
   void onEvent<Settings>("settings-changed", (s) => {
     settings = { ...settings, ...s };

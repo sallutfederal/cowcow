@@ -7,6 +7,7 @@ mod integrations;
 mod island;
 mod log;
 mod ollama;
+mod openai;
 mod pipe;
 mod secrets;
 mod settings;
@@ -49,8 +50,11 @@ pub struct BootInfo {
 #[tauri::command]
 fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
     let mut settings = shared.settings.lock().unwrap().clone();
-    // The real state of ~/.claude/settings.json wins over whatever we stored.
-    settings.hooks_installed = hooks::status().installed;
+    // The real state of each agent's config wins over whatever we stored.
+    settings.hooks_installed = hooks::status(hooks::AgentProvider::Claude).installed;
+    settings.codex_hooks_installed = hooks::status(hooks::AgentProvider::Codex).installed;
+    settings.kimi_hooks_installed = hooks::status(hooks::AgentProvider::Kimi).installed;
+    settings = settings::with_all_agents(settings);
     let screen = island::screen_info(&app, &settings.screen);
     BootInfo {
         settings,
@@ -66,7 +70,7 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
         let autostart_changed = current.autostart != settings.autostart;
-        *current = settings.clone();
+        *current = settings::with_all_agents(settings.clone());
         (screen_changed, autostart_changed)
     };
     if let Err(err) = settings::save(&settings) {
@@ -185,17 +189,18 @@ fn set_paused(paused: bool) {
     integrations::set_paused(paused);
 }
 
-// ── Claude Code hooks ─────────────────────────────────────────────────────────
+// ── Agent hooks (Claude Code, Codex, Cursor) ──────────────────────────────────
 
+/// Installed state for every agent Coucou follows.
 #[tauri::command]
-fn hooks_status() -> HookStatus {
-    hooks::status()
+fn hooks_status() -> Vec<HookStatus> {
+    hooks::status_all()
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
-fn hooks_preview(install: bool) -> Result<HookPreview, String> {
-    hooks::preview(install)
+fn hooks_preview(provider: String, install: bool) -> Result<HookPreview, String> {
+    hooks::preview(provider_of(&provider)?, install)
 }
 
 /// Only ever called from an explicit click in the settings window.
@@ -203,20 +208,30 @@ fn hooks_preview(install: bool) -> Result<HookPreview, String> {
 fn hooks_apply(
     app: AppHandle,
     shared: State<Shared>,
+    provider: String,
     install: bool,
     fingerprint: String,
 ) -> Result<String, String> {
+    let provider = provider_of(&provider)?;
     // The fingerprint comes from the preview the user actually looked at, so a
-    // settings.json that changed in between is refused rather than overwritten.
-    let backup = hooks::write(install, &fingerprint)?;
+    // config that changed in between is refused rather than overwritten.
+    let backup = hooks::write(provider, install, &fingerprint)?;
     let updated = {
         let mut current = shared.settings.lock().unwrap();
-        current.hooks_installed = install;
+        match provider {
+            hooks::AgentProvider::Claude => current.hooks_installed = install,
+            hooks::AgentProvider::Codex => current.codex_hooks_installed = install,
+            hooks::AgentProvider::Kimi => current.kimi_hooks_installed = install,
+        }
         let _ = settings::save(&current);
         current.clone()
     };
     let _ = app.emit("settings-changed", updated);
     Ok(backup)
+}
+
+fn provider_of(id: &str) -> Result<hooks::AgentProvider, String> {
+    hooks::AgentProvider::parse(id).ok_or_else(|| format!("Unknown agent: {id}"))
 }
 
 #[tauri::command]
@@ -242,29 +257,62 @@ fn approval_decline(app: AppHandle, request_id: String) {
 // ── Chat, files and secrets ───────────────────────────────────────────────────
 
 /// One chat turn. The API key and any file bytes stay on the Rust side.
+///
+/// The provider was picked once in the settings window; the island asks with
+/// whatever that provider currently has selected.
 #[tauri::command]
 async fn chat_send(
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
     local: State<'_, ollama::LocalChat>,
+    openai: State<'_, openai::OpenAiChat>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let (provider, model, base_url) = {
+    let (provider, config) = {
         let current = shared.settings.lock().unwrap();
-        (current.provider.clone(), current.model.clone(), current.base_url.clone())
+        settings::chat_provider(&current)
     };
+    let model = config.model.trim().to_string();
+    let base_url = config.base_url;
 
-    if provider == ollama::PROVIDER_OLLAMA {
-        return ollama::send(&local, &base_url, &model, query, context).await;
+    match provider.as_str() {
+        ollama::PROVIDER_OLLAMA => ollama::send(&local, &base_url, &model, query, context).await,
+        // Anything we do not have a dedicated client for speaks the
+        // OpenAI-compatible shape, which is Codex, Kimi and every local gateway.
+        ollama::PROVIDER_ANTHROPIC => claude::send(&chat, &model, query, context).await,
+        _ => {
+            let key = api_key_for(&provider)?;
+            openai::send(&openai, &model, &base_url, &key, query, context).await
+        }
     }
-    claude::send(&chat, &model, query, context).await
+}
+
+/// The key for one provider, from the Credential Manager.
+///
+/// Claude's key predates the per-provider names and is still read as a fallback,
+/// so an existing installation keeps working without anybody touching anything.
+fn api_key_for(provider: &str) -> Result<String, String> {
+    if let Some(key) = secrets::get(&settings::api_key_name(provider)) {
+        return Ok(key);
+    }
+    if provider == ollama::PROVIDER_ANTHROPIC {
+        if let Some(key) = secrets::get("anthropic-api-key") {
+            return Ok(key);
+        }
+    }
+    Err(format!("No API key for {provider}. Open settings."))
 }
 
 #[tauri::command]
-fn chat_reset(chat: State<'_, Chat>, local: State<'_, ollama::LocalChat>) {
+fn chat_reset(
+    chat: State<'_, Chat>,
+    local: State<'_, ollama::LocalChat>,
+    openai: State<'_, openai::OpenAiChat>,
+) {
     chat.reset();
     local.reset();
+    openai.reset();
 }
 
 /// The models the local Ollama daemon has. Called from the settings window only,
@@ -399,6 +447,7 @@ pub fn run() {
         .manage(Pending::default())
         .manage(Chat::default())
         .manage(ollama::LocalChat::default())
+        .manage(openai::OpenAiChat::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,

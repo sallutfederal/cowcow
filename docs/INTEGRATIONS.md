@@ -65,8 +65,33 @@ Demande l'autorisation Automatisation la première fois (normal).
 4. Montrer le diff à Louis, attendre son OK, écrire.
 5. Bouton « Désinstaller les hooks » dans les réglages qui retire uniquement les entrées Notch Buddy.
 
----
+### 1.1 Codex et Kimi Code (mêmes règles, fichiers et formes différents)
 
+Windows uniquement. Le relais est le **même** exécutable : `coucou-hook <provider> <Event>`. Sans
+provider, c'est Claude Code — les installations existantes ne changent pas.
+
+| Agent | Fichier | Forme d'une entrée |
+|---|---|---|
+| Claude Code | `~/.claude/settings.json` | `{ "hooks": [ { "hooks": [ { "type": "command", … } ] } ] }` |
+| Codex | `~/.codex/hooks.json` | identique à Claude Code |
+| Kimi Code | `~/.kimi/config.toml` (ou `~/.kimi-code/config.toml` si c'est celui qui existe) | **TOML** : une table `[[hooks]]` par événement |
+
+- **Codex** parle le protocole de Claude Code (payload stdin `hook_event_name` en PascalCase, même
+  `hookSpecificOutput`). Donc : mêmes événements, mêmes réponses, et l'**approbation depuis l'île
+  fonctionne**. Note : `StopFailure` n'existe pas chez Codex — ne pas l'installer.
+  Après installation, Codex peut demander de faire confiance aux hooks : `trust` via `/hooks`.
+  Certains builds exigent `[features] codex_hooks = true` dans `~/.codex/config.toml` ; Coucou ne
+  touche pas à ce fichier.
+- **Kimi Code** : 13 événements, payload stdin en PascalCase, `hookSpecificOutput` identique à Claude
+  Code. Fichier TOML : l'édition est faite ligne à ligne (on ne touche qu'à nos `[[hooks]]`, tout le
+  reste est renvoyé à l'octet près), installer deux fois ne duplique rien, et la désinstallation ne
+  retire que nos tables. Kimi **n'a pas** d'événement de permission et se règle sur le code de sortie :
+  l'approbation reste dans sa propre UI, l'île montre ce qui se passe.
+- `source` (`claude` | `codex` | `kimi`) ajouté à chaque payload par le relais. Pas de
+  normalisation d'événements : les trois agents parlent déjà le même vocabulaire.
+- Couleurs : Codex `#10A37F`, Kimi `#22D3EE` (§ 6). Pill et ticker propres à chaque agent.
+
+---
 ## 2. n8n (workflows de Louis)
 
 - Réglages : URL de l'instance (probablement `https://n8nlouis.dcsys.tech`, **à confirmer avec Louis**) et clé API n8n (Trousseau). La clé se crée dans n8n : Settings → n8n API.
@@ -124,7 +149,31 @@ Permissions : Enregistrement de l'écran (capture) et Automatisation (navigateur
 - Erreur réseau ou clé invalide : état `error`, vue `note` avec la raison en une phrase et « Ouvre les réglages pour vérifier la clé ».
 - Micro (bouton du champ) : dictée `SFSpeechRecognizer` en `fr-FR`, sur l'appareil si possible. Optionnel (M9). Si la permission est refusée, masquer le bouton.
 
-### 5.1 Provider local : Ollama (Windows)
+### 5.1 Providers et agents (fenêtre de réglages)
+
+Un seul niveau, **par provider** — une clé écrite une fois, utilisée partout.
+
+| Provider | Adresse (pré-remplie) | Clé | Modèles proposés |
+|---|---|---|---|
+| Anthropic (Claude) | integree au client, rien a saisir | `api-key-anthropic` (`sk-ant-...`) | claude-opus-5, claude-sonnet-5, claude-haiku-4-5 |
+| OpenAI | `https://api.openai.com/v1` | `api-key-openai` (`sk-…`) | gpt-5.1-codex, gpt-5.1, gpt-5-mini |
+| Moonshot (Kimi) | `https://api.moonshot.ai/v1` | `api-key-moonshot` (`sk-…`) | kimi-k2-turbo-preview, kimi-k2-0711-preview, kimi-latest |
+| Ollama (local) | `http://127.0.0.1:11434`, seule adresse modifiable + « Detect models » | aucune | ceux du daemon |
+
+- Le champ **Model** est une saisie libre avec suggestions : les fournisseurs sortent des modèles
+  chaque semaine, une liste figée serait fausse le mois prochain.
+- L'adresse n'est affichée que pour Ollama : une adresse qui change d'une machine à l'autre. Pour
+  les autres, elle est déjà configurée — l'utilisateur choisit un modèle et colle sa clé, rien de plus.
+- **Un seul choix de provider pour tout le monde** : une ligne « Chat answers with ». Claude Code,
+  Codex et Kimi Code ont chacun un compte déjà payé, donc demander trois fois était du bruit.
+- Clés dans le Trousseau Windows (`api-key-<provider>`). L'ancienne `anthropic-api-key` est encore lue
+  comme solution de repli pour Anthropic.
+- Un `settings.json` écrit quand chaque agent choisit son propre provider (`chatAgents`,
+  `cursorHooksInstalled`…) se charge toujours : les clés que Coucou ne lit plus sont ignorées.
+- Tout provider inconnu est traité comme **OpenAI-compatible** (`{base}/chat/completions`), ce qui couvre
+  Codex, Kimi, LM Studio, llama.cpp et tout gateway local.
+
+### 5.2 Provider local : Ollama (Windows)
 
 - Choix du provider et du modèle dans les réglages : `Provider` = `Claude (Anthropic API)` ou `Ollama — local models`. Le champ `Model` dépend du provider ; l'historique de conversation est distinct pour les deux.
 - **Aucune clé** pour Ollama : rien n'est écrit dans le Credential Manager, et rien ne sort de la machine tant que l'adresse est `127.0.0.1`.

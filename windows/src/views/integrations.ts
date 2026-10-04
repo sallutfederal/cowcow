@@ -6,7 +6,7 @@
 
 import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
-import { State, type AgentTask } from "../core/state";
+import { State, AGENT_TASK_IDS, type AgentTask } from "../core/state";
 import { Bridge } from "../core/bridge";
 
 /** Same shape as the Swift `timeAgo` computed properties. */
@@ -57,9 +57,10 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   const info = State.integrations[task.id];
   const configured = info?.configured ?? false;
   const error = info?.error ?? null;
-  // The Claude Code pill is about hooks, not a key — the macOS wording would be
+  // The coding agents are about hooks, not a key — the macOS wording would be
   // misleading here.
-  const missing = task.id === "integration_claude" ? "Hooks not installed" : "Key not configured";
+  const isAgent = Object.values(AGENT_TASK_IDS).includes(task.id as never);
+  const missing = isAgent ? "Hooks not installed" : "Key not configured";
   const label = error ?? (configured ? "Connected · loading…" : missing);
   const statusColor = error || !configured ? "#F4505E" : "#22C55E";
 
@@ -110,7 +111,7 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   return h(
     "div",
     { class: "int-card" },
-    header(task.color, task.id === "integration_claude" ? "VS Code" : task.name, "Integration"),
+    header(task.color, task.name, task.sessionProject ?? "Agent"),
     h("div", { class: "int-status" }, dot(statusColor, 5), h("span", { text: label })),
     actions,
   );

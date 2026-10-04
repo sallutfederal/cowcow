@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Settings } from "./state";
+import type { AgentId } from "./state";
 
 export const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -61,15 +62,16 @@ export const Bridge = {
   log: (message: string) => call<void>("log_line", { message }),
 
   // ── Claude Code hooks ─────────────────────────────────────────────────────
-  hooksStatus: () => call<HookStatus>("hooks_status"),
+  hooksStatus: () => call<HookStatus[]>("hooks_status"),
   /** Diff to show before anything is written. `install: false` previews removal. */
-  hooksPreview: (install: boolean) => callOrThrow<HookPreview>("hooks_preview", { install }),
+  hooksPreview: (provider: AgentId, install: boolean) =>
+    callOrThrow<HookPreview>("hooks_preview", { provider, install }),
   /**
-   * Writes ~/.claude/settings.json — only ever after an explicit click, and only
+   * Writes the agent's config — only ever after an explicit click, and only
    * when the file still matches the preview the user looked at.
    */
-  hooksApply: (install: boolean, fingerprint: string) =>
-    callOrThrow<string>("hooks_apply", { install, fingerprint }),
+  hooksApply: (provider: AgentId, install: boolean, fingerprint: string) =>
+    callOrThrow<string>("hooks_apply", { provider, install, fingerprint }),
 
   approvalDecision: (requestId: string, decision: "allow" | "deny") =>
     call<void>("approval_decision", { requestId, decision }),
@@ -80,6 +82,7 @@ export const Bridge = {
 
   // ── Chat, files, secrets ──────────────────────────────────────────────────
   /** One chat turn. The API key and any file bytes never leave Rust. */
+  /** One chat turn, answered by the provider chosen in the settings window. */
   chatSend: (query: string, context: ChatContext | null) =>
     callOrThrow<{ text: string }>("chat_send", { query, context }),
   chatReset: () => call<void>("chat_reset"),
@@ -130,6 +133,8 @@ export interface LocalModel {
 }
 
 export interface HookStatus {
+  provider: AgentId;
+  name: string;
   installed: boolean;
   settingsPath: string;
   hookPath: string;

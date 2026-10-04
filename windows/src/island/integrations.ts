@@ -4,8 +4,13 @@
 
 import { onEvent, Bridge, type IntegrationUpdate } from "../core/bridge";
 import { Sound } from "../core/sound";
-import { State } from "../core/state";
+import { AGENT_TASK_IDS, State } from "../core/state";
 import type { Island } from "./island";
+
+/** Task id → which agent it follows, so a status can find its pill. */
+const AGENT_ID_BY_TASK: Record<string, string> = Object.fromEntries(
+  Object.entries(AGENT_TASK_IDS).map(([agent, id]) => [id, agent]),
+);
 
 /** Which Credential Manager key backs each pill. */
 const KEY_FOR: Record<string, string> = {
@@ -32,11 +37,14 @@ export async function refreshConfigured() {
     const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
     State.integrations[id] = { ...info, configured: present };
   }
-  const hooks = State.settings.hooksInstalled;
-  const claude = State.integrations.integration_claude ?? {
-    data: {}, error: null, loaded: false, configured: false,
-  };
-  State.integrations.integration_claude = { ...claude, configured: hooks };
+  // The coding agents are about hooks, not keys — ask for the real thing rather
+  // than trusting what was saved the last time.
+  const statuses = (await Bridge.hooksStatus()) ?? [];
+  for (const agent of Object.values(AGENT_TASK_IDS)) {
+    const installed = statuses.some((s) => s.installed && AGENT_ID_BY_TASK[s.provider] === agent);
+    const info = State.integrations[agent] ?? { data: {}, error: null, loaded: false, configured: false };
+    State.integrations[agent] = { ...info, configured: installed };
+  }
   State.notify();
 }
 

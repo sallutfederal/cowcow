@@ -5,9 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Who answers the chat for one agent, and with which model.
-///
-
 /// What one provider needs: which model is selected and where it lives. The API
 /// key is not here — it lives in the Credential Manager under one name per
 /// provider, so a single key is typed once and every agent using it benefits.
@@ -224,8 +221,10 @@ mod tests {
 
     #[test]
     fn the_chat_answers_with_the_one_provider_that_was_chosen() {
-        let mut settings = Settings::default();
-        settings.chat_provider = "moonshot".into();
+        let mut settings = Settings {
+            chat_provider: "moonshot".into(),
+            ..Default::default()
+        };
         settings.providers.get_mut("moonshot").unwrap().model = "kimi-latest".into();
 
         let (provider, config) = chat_provider(&settings);
@@ -235,8 +234,10 @@ mod tests {
 
     #[test]
     fn an_empty_choice_falls_back_to_anthropic() {
-        let mut settings = Settings::default();
-        settings.chat_provider = "   ".into();
+        let settings = Settings {
+            chat_provider: "   ".into(),
+            ..Default::default()
+        };
         assert_eq!(chat_provider(&settings).0, "anthropic");
     }
 
@@ -244,9 +245,11 @@ mod tests {
     /// provider and model in the flat fields; do not throw that away.
     #[test]
     fn claude_keeps_the_flat_settings_an_older_build_wrote() {
-        let mut settings = Settings::default();
-        settings.model = "claude-sonnet-5".into();
-        settings.provider = "anthropic".into();
+        let mut settings = Settings {
+            model: "claude-sonnet-5".into(),
+            provider: "anthropic".into(),
+            ..Default::default()
+        };
         settings.providers.clear();
 
         let (provider, config) = chat_provider(&settings);

@@ -11,6 +11,7 @@ mod openai;
 mod pipe;
 mod secrets;
 mod settings;
+mod tools;
 mod tray;
 mod win_user;
 

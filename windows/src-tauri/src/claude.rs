@@ -6,7 +6,6 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -42,31 +41,6 @@ pub(crate) const LOCAL_SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assis
 Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
 No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
 
-#[derive(Default)]
-pub struct Chat {
-    /// Full multi-turn history, including tool_use / tool_result blocks.
-    messages: Mutex<Vec<Value>>,
-}
-
-impl Chat {
-    pub fn reset(&self) {
-        self.messages.lock().unwrap().clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.messages.lock().unwrap().is_empty()
-    }
-
-    fn snapshot(&self) -> Vec<Value> {
-        self.messages.lock().unwrap().clone()
-    }
-
-    /// Commits a finished turn. Only called once the model has answered: a turn
-    /// that failed leaves the history exactly as it was.
-    fn replace(&self, messages: Vec<Value>) {
-        *self.messages.lock().unwrap() = messages;
-    }
-}
 
 // ── the agent loop ──────────────────────────────────────────────────────────
 
@@ -542,19 +516,18 @@ pub struct ChatReply {
 /// history is committed only when the turn succeeds, which is why a failed
 /// turn leaves the chat exactly as it was.
 pub async fn send(
-    chat: &Chat,
+    history: &mut Vec<Value>,
     model: &str,
     query: String,
     context: Option<ChatContext>,
     ctx: &ToolCtx,
 ) -> Result<ChatReply, String> {
-    let mut messages = chat.snapshot();
 
     let mut content: Vec<Value> = Vec::new();
 
     // File / window context rides along with the first message only, exactly
     // like ClaudeService.chat().
-    if chat.is_empty() {
+    if history.is_empty() {
         match &context {
             Some(ChatContext::File { name, path }) => {
                 if let Some(block) = file_block(path) {
@@ -573,10 +546,10 @@ pub async fn send(
         }
     }
     content.push(json!({ "type": "text", "text": query }));
-    messages.push(json!({ "role": "user", "content": content }));
+    history.push(json!({ "role": "user", "content": content }));
 
     let reply = send_agent(
-        &mut messages,
+        history,
         model,
         SYSTEM_PROMPT,
         &tools::registry(),
@@ -585,8 +558,6 @@ pub async fn send(
     )
     .await?;
 
-
-    chat.replace(messages);
     Ok(reply)
 }
 

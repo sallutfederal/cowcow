@@ -6,7 +6,6 @@
 // request is built and read in Rust, exactly like the Claude path, so a file's
 // bytes never cross the IPC boundary.
 
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -49,34 +48,6 @@ pub struct LocalModel {
     pub cloud: bool,
 }
 
-/// Multi-turn history in Ollama's own message shape.
-#[derive(Default)]
-pub struct LocalChat {
-    messages: Mutex<Vec<Value>>,
-}
-
-impl LocalChat {
-    pub fn reset(&self) {
-        self.messages.lock().unwrap().clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.messages.lock().unwrap().is_empty()
-    }
-
-    fn push(&self, message: Value) {
-        self.messages.lock().unwrap().push(message);
-    }
-
-    fn pop(&self) {
-        self.messages.lock().unwrap().pop();
-    }
-
-    fn snapshot(&self) -> Vec<Value> {
-        self.messages.lock().unwrap().clone()
-    }
-}
-
 /// `GET {base}/api/tags` — the models the daemon actually has.
 pub async fn models(base_url: &str) -> Result<Vec<LocalModel>, String> {
     let url = endpoint(base_url, "/api/tags")?;
@@ -100,7 +71,7 @@ pub async fn models(base_url: &str) -> Result<Vec<LocalModel>, String> {
 
 /// One chat turn against `POST {base}/api/chat`.
 pub async fn send(
-    chat: &LocalChat,
+    history: &mut Vec<Value>,
     base_url: &str,
     model: &str,
     query: String,
@@ -118,7 +89,7 @@ pub async fn send(
     // File / window context rides along with the first message only, like the
     // Claude path. Ollama takes images as base64 next to the message, so they go
     // in their own field rather than in the text.
-    if chat.is_empty() {
+    if history.is_empty() {
         match &context {
             Some(ChatContext::File { name, path }) => {
                 if let Some(file) = attachment(path) {
@@ -148,12 +119,12 @@ pub async fn send(
     if !images.is_empty() {
         user["images"] = json!(images);
     }
-    chat.push(user);
+    history.push(user);
 
     let body = json!({
         "model": model,
         "system": SYSTEM_PROMPT,
-        "messages": chat.snapshot(),
+        "messages": history.clone(),
         "stream": false,
         "options": { "num_ctx": NUM_CTX },
     });
@@ -166,7 +137,7 @@ pub async fn send(
     let response = match client.post(&url).json(&body).send().await {
         Ok(r) => r,
         Err(err) => {
-            chat.pop(); // keep the history consistent with what the model saw
+            history.pop(); // keep the history consistent with what the model saw
             return Err(unreachable_error(base_url, &err));
         }
     };
@@ -175,12 +146,12 @@ pub async fn send(
     let raw = match response.text().await {
         Ok(t) => t,
         Err(err) => {
-            chat.pop();
+            history.pop();
             return Err(err.to_string());
         }
     };
     if !status.is_success() {
-        chat.pop();
+        history.pop();
         // Surface the daemon's own message — that is what makes a bad model name
         // ("model not found, try pulling it first") obvious.
         let detail = serde_json::from_str::<Value>(&raw)
@@ -193,12 +164,12 @@ pub async fn send(
     let text = match parse_reply(&raw) {
         Ok(t) => t,
         Err(err) => {
-            chat.pop();
+            history.pop();
             return Err(err);
         }
     };
 
-    chat.push(json!({ "role": "assistant", "content": text.clone() }));
+    history.push(json!({ "role": "assistant", "content": text.clone() }));
     Ok(ChatReply { text })
 }
 

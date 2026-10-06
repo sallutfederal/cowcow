@@ -85,7 +85,18 @@ export const Bridge = {
   /** One chat turn, answered by the provider chosen in the settings window. */
   chatSend: (query: string, context: ChatContext | null) =>
     callOrThrow<{ text: string }>("chat_send", { query, context }),
-  chatReset: () => call<void>("chat_reset"),
+  /** Starts a new conversation and hands back its id. */
+  chatReset: () => call<string>("chat_reset"),
+  /** The saved conversations, most recent first. */
+  chatSessions: () =>
+    call<
+      { id: string; title: string | null; cwd: string; createdAt: number; lastSeen: number }[]
+    >("chat_sessions"),
+  /** Full-text search across every saved conversation. */
+  chatSearch: (query: string) =>
+    call<{ sessionId: string; role: string; text: string }[]>("chat_search", {
+      query,
+    }),
 
   /** Models the local Ollama daemon has. Fails with a readable message. */
   ollamaModels: () => callOrThrow<LocalModel[]>("ollama_models"),

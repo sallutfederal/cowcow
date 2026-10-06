@@ -9,7 +9,6 @@
 // Everything happens here rather than in the island: the API key never leaves the
 // Credential Manager, and file bytes never cross the IPC boundary.
 
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -21,38 +20,10 @@ const MAX_TOKENS: u32 = 4096;
 const MAX_INLINE_TEXT: u64 = 200_000;
 const TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Multi-turn history in OpenAI's own message shape.
-#[derive(Default)]
-pub struct OpenAiChat {
-    messages: Mutex<Vec<Value>>,
-}
-
-impl OpenAiChat {
-    pub fn reset(&self) {
-        self.messages.lock().unwrap().clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.messages.lock().unwrap().is_empty()
-    }
-
-    fn push(&self, message: Value) {
-        self.messages.lock().unwrap().push(message);
-    }
-
-    fn pop(&self) {
-        self.messages.lock().unwrap().pop();
-    }
-
-    fn snapshot(&self) -> Vec<Value> {
-        self.messages.lock().unwrap().clone()
-    }
-}
-
 /// One chat turn. `api_key` is the provider's key, already read from the
 /// Credential Manager by the caller.
 pub async fn send(
-    chat: &OpenAiChat,
+    history: &mut Vec<Value>,
     model: &str,
     base_url: &str,
     api_key: &str,
@@ -72,11 +43,11 @@ pub async fn send(
         "content": crate::claude::LOCAL_SYSTEM_PROMPT,
     })];
     // Everything said so far, so the second turn knows the first.
-    messages.extend(chat.snapshot());
+    messages.extend(history.iter().cloned());
 
     // File / window context rides along with the first message only, exactly
     // like the Claude path.
-    if chat.is_empty() {
+    if history.is_empty() {
         match &context {
             Some(ChatContext::File { name, path }) => {
                 if let Some(parts) = file_parts(path) {
@@ -101,7 +72,7 @@ pub async fn send(
     // One content value, used both in the request and in the history we keep.
     let user = json!({ "role": "user", "content": query });
     messages.push(user.clone());
-    chat.push(user);
+    history.push(user);
 
     let body = json!({
         "model": model,
@@ -121,7 +92,8 @@ pub async fn send(
     {
         Ok(r) => r,
         Err(err) => {
-            chat.pop(); // keep the history consistent with what the model saw
+            // The failed turn leaves the history exactly as it was.
+        history.pop();
             return Err(network_error(base_url, &err));
         }
     };
@@ -130,12 +102,12 @@ pub async fn send(
     let raw = match response.text().await {
         Ok(t) => t,
         Err(err) => {
-            chat.pop();
+            history.pop();
             return Err(err.to_string());
         }
     };
     if !status.is_success() {
-        chat.pop();
+        history.pop();
         // Surface the API's own message: that is what makes a bad key or a model
         // name the account cannot reach obvious.
         let detail = serde_json::from_str::<Value>(&raw)
@@ -153,12 +125,12 @@ pub async fn send(
     let text = match parse_reply(&raw) {
         Ok(t) => t,
         Err(err) => {
-            chat.pop();
+            history.pop();
             return Err(err);
         }
     };
 
-    chat.push(json!({ "role": "assistant", "content": text.clone() }));
+    history.push(json!({ "role": "assistant", "content": text.clone() }));
     Ok(ChatReply { text })
 }
 

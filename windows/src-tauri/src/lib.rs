@@ -11,9 +11,15 @@ mod openai;
 mod pipe;
 mod secrets;
 mod settings;
+mod store;
 mod tools;
 mod tray;
 mod win_user;
+
+/// For the integration tests in `tests/`, which live outside the crate and
+/// cannot see a private module.
+#[doc(hidden)]
+pub use store::{testing_clients, testing_store};
 
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -24,12 +30,13 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
-use claude::{Chat, ChatContext, ChatReply};
+use claude::{ChatContext, ChatReply};
 use files::DroppedFile;
 use hooks::{HookPreview, HookStatus};
 use island::{PollGate, ScreenInfo};
 use pipe::Pending;
 use settings::Settings;
+use store::ChatStore;
 
 /// Keeps spawned helpers from flashing a console window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -294,16 +301,28 @@ fn set_shell_settings(shared: State<'_, Shared>, shell: settings::ShellSettings)
     settings::set_shell_settings(shell)
 }
 
+/// Which conversation the island is in.
+///
+/// A newtype rather than a bare Mutex<Option<String>> so the commands can
+/// name it, and so the id has one obvious home: it is set on the first send and
+/// replaced by chat_reset.
+#[derive(Default)]
+pub struct Session(pub Mutex<Option<String>>);
+
 /// One chat turn. The API key and any file bytes stay on the Rust side.
 ///
 /// The provider was picked once in the settings window; the island asks with
 /// whatever that provider currently has selected.
+///
+/// The history is loaded from the session store, handed to the client, and
+/// whatever the turn added is written back — so tool_use and tool_result blocks
+/// are persisted with their structure, and the same conversation comes back
+/// after a restart.
 #[tauri::command]
 async fn chat_send(
     shared: State<'_, Shared>,
-    chat: State<'_, Chat>,
-    local: State<'_, ollama::LocalChat>,
-    openai: State<'_, openai::OpenAiChat>,
+    store: State<'_, ChatStore>,
+    session: State<'_, Session>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
@@ -314,19 +333,51 @@ async fn chat_send(
     let model = config.model.trim().to_string();
     let base_url = config.base_url;
 
-    match provider.as_str() {
-        ollama::PROVIDER_OLLAMA => ollama::send(&local, &base_url, &model, query, context).await,
+    let session_id = current_session(&session)?;
+    let mut history = store.load_session(&session_id)?;
+    // Everything past this point is new, and gets saved.
+    let already_saved = history.len();
+
+    let outcome = match provider.as_str() {
+        ollama::PROVIDER_OLLAMA => {
+            ollama::send(&mut history, &base_url, &model, query, context).await
+        }
         // Anything we do not have a dedicated client for speaks the
         // OpenAI-compatible shape, which is Codex, Kimi and every local gateway.
         ollama::PROVIDER_ANTHROPIC => {
             let ctx = chat_tool_ctx();
-            claude::send(&chat, &model, query, context, &ctx).await
+            claude::send(&mut history, &model, query, context, &ctx).await
         }
         _ => {
             let key = api_key_for(&provider)?;
-            openai::send(&openai, &model, &base_url, &key, query, context).await
+            openai::send(&mut history, &model, &base_url, &key, query, context).await
         }
+    };
+
+    // A client that failed rolled its own turn back, so this saves whatever
+    // actually reached the model — nothing new on a failure, the completed
+    // exchange otherwise. Either way the store ends up describing what the
+    // model has seen.
+    for message in history.iter().skip(already_saved) {
+        store.append(&session_id, &provider, message, None, None)?;
     }
+
+    outcome
+}
+
+/// The session the app is talking to, opened on first use.
+fn current_session(session: &State<'_, Session>) -> Result<String, String> {
+    let mut guard = session.0.lock().unwrap();
+    if let Some(id) = guard.as_ref() {
+        return Ok(id.clone());
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let store = ChatStore::open()?;
+    let id = store.resume_or_create(&cwd)?;
+    *guard = Some(id.clone());
+    Ok(id)
 }
 
 /// The key for one provider, from the Credential Manager.
@@ -345,15 +396,71 @@ fn api_key_for(provider: &str) -> Result<String, String> {
     Err(format!("No API key for {provider}. Open settings."))
 }
 
+/// Starts a new conversation and returns its id.
+///
+/// The old one is kept: a new chat is a new session, not a deletion, so
+/// anything said before is still there to search for.
 #[tauri::command]
 fn chat_reset(
-    chat: State<'_, Chat>,
-    local: State<'_, ollama::LocalChat>,
-    openai: State<'_, openai::OpenAiChat>,
-) {
-    chat.reset();
-    local.reset();
-    openai.reset();
+    store: State<'_, ChatStore>,
+    session: State<'_, Session>,
+) -> Result<String, String> {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = store.new_session(&cwd)?;
+    *session.0.lock().unwrap() = Some(id.clone());
+    Ok(id)
+}
+
+/// The saved conversations, most recent first.
+#[tauri::command]
+fn chat_sessions(store: State<'_, ChatStore>) -> Result<Vec<SessionInfo>, String> {
+    let sessions = store.list_sessions()?;
+    Ok(sessions
+        .into_iter()
+        .map(|s| SessionInfo {
+            id: s.id,
+            title: s.title,
+            cwd: s.cwd,
+            created_at: s.created_at,
+            last_seen: s.last_seen,
+        })
+        .collect())
+}
+
+/// Full-text search across every saved conversation.
+#[tauri::command]
+fn chat_search(store: State<'_, ChatStore>, query: String) -> Result<Vec<SearchHit>, String> {
+    let hits = store.search_fts(&query, 50)?;
+    Ok(hits
+        .into_iter()
+        .map(|h| SearchHit {
+            session_id: h.session_id,
+            role: h.role,
+            text: store::excerpt(&h.text, &query, 160),
+        })
+        .collect())
+}
+
+/// One saved conversation, for the island to list.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    id: String,
+    title: Option<String>,
+    cwd: String,
+    created_at: i64,
+    last_seen: i64,
+}
+
+/// One search result, with the text already cut around the match.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    session_id: String,
+    role: String,
+    text: String,
 }
 
 /// The models the local Ollama daemon has. Called from the settings window only,
@@ -486,9 +593,19 @@ pub fn run() {
             gate: gate.clone(),
         })
         .manage(Pending::default())
-        .manage(Chat::default())
-        .manage(ollama::LocalChat::default())
-        .manage(openai::OpenAiChat::default())
+        // Opened here so a broken database is a startup failure the user hears
+        // about, not a failure on their first question. A store that will not
+        // open leaves the app running with chat disabled rather than not at all.
+        .manage(
+            ChatStore::open()
+                .unwrap_or_else(|e| {
+                    crate::log::line(format!("sessao salva indisponivel: {e}"));
+                    ChatStore::open_at(std::path::Path::new(":memory:"))
+                        .unwrap_or_else(|_| panic!("nem em memoria"))
+                }),
+        )
+        // Which conversation the island is in; None until the first send.
+        .manage(Session::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
@@ -509,6 +626,8 @@ pub fn run() {
             log_line,
             chat_send,
             chat_reset,
+    chat_sessions,
+    chat_search,
             ollama_models,
             ingest_file,
             secret_present,

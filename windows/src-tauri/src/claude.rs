@@ -693,6 +693,110 @@ mod tests {
     }
 
     #[test]
+    fn the_body_carries_the_tool_schemas_in_the_shape_the_api_expects() {
+        // The one thing a wrong tool array would break silently: without this,
+        // the loop's mechanics are fine and every real call 400s.
+        let (sent, transport) = scripted(vec![turn("end_turn", "ok")]);
+        let mut chat = vec![];
+        let tools = tools::registry();
+
+        block_on(run_loop(
+            &mut chat,
+            "sys",
+            &tools,
+            &ctx(),
+            &AgentTurn::default(),
+            "claude-opus-5",
+            transport,
+        ))
+        .expect("ok");
+
+        let tools_sent = body(&sent, 0)["tools"].clone();
+        let list = tools_sent.as_array().expect("tools is a list");
+        // Server-side web search first, then the seven client-side ones.
+        assert_eq!(list.len(), 8, "web_search + as sete ferramentas");
+        assert_eq!(list[0]["type"], "web_search_20260209");
+
+        for entry in &list[1..] {
+            assert!(entry["name"].is_string(), "{entry}");
+            assert!(entry["description"].is_string(), "{entry} sem descrição");
+            // Anthropic's key is `input_schema`, not `schema` or `parameters`.
+            let schema = entry
+                .get("input_schema")
+                .unwrap_or_else(|| panic!("{} sem input_schema: {entry}", entry["name"]));
+            assert_eq!(schema["type"], "object", "{}", entry["name"]);
+            assert!(
+                schema["required"].is_array(),
+                "{} sem required: {schema}",
+                entry["name"]
+            );
+            // The client-side shape must not leak the server-only keys.
+            assert!(entry.get("type").is_none(), "{}", entry["name"]);
+        }
+
+        let read = list
+            .iter()
+            .find(|t| t["name"] == "read_file")
+            .expect("read_file registrado");
+        let required = read["input_schema"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("path")));
+    }
+
+    #[tokio::test]
+    async fn the_tool_name_that_arrives_is_the_one_that_runs() {
+        // A `tool_use` naming something real has to reach that tool, with its
+        // `input` intact: a dispatcher that always answered "desconhecida" would
+        // pass every other test here.
+        let (sent, transport) = scripted(vec![
+            json!({
+                "stop_reason": "tool_use",
+                "content": [tool_call(
+                    "tu_1",
+                    "write_file",
+                    json!({ "path": "do-loop.txt", "content": "escrito pelo loop" }),
+                )],
+            }),
+            turn("end_turn", "pronto"),
+        ]);
+        let mut chat = vec![];
+        let dir = std::env::temp_dir().join(format!("coucou-dispatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ctx = ToolCtx::new(dir.clone());
+        ctx.dry_run = true;
+
+        run_loop(
+            &mut chat,
+            "sys",
+            &tools::registry(),
+            &ctx,
+            &AgentTurn::default(),
+            "claude-opus-5",
+            transport,
+        )
+        .await
+        .expect("o loop fecha");
+
+        assert_eq!(calls(&sent), 2);
+        let result = &tool_result_turn(&chat)["content"][0];
+        assert_eq!(result["tool_use_id"], "tu_1");
+        // The tool it named ran, and its `input` arrived intact: dry-run write_file
+        // reports the byte count of what it was handed, and "escrito pelo loop"
+        // is exactly 17 bytes — a dispatcher that dropped or faked the input
+        // could not produce that number.
+        let payload = result["content"].as_str().unwrap_or_default();
+        assert!(payload.contains("do-loop.txt"), "write_file não despachou: {payload}");
+        assert!(
+            payload.contains("\"bytes\":17"),
+            "o input não chegou íntegro: {payload}"
+        );
+        assert!(
+            !dir.join("do-loop.txt").exists(),
+            "dry-run não pode escrever"
+        );
+    }
+
+    #[test]
     fn base64_matches_rfc4648_vectors() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");

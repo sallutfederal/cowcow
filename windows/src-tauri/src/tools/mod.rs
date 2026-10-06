@@ -81,7 +81,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         def(
             "grep",
-            "Search files for a regular expression. Returns matches with file, line and text, plus the total number found.",
+            "Search files for a regular expression. Returns at most max matches, each with file, line and text, plus the real total found; the search reads each file until that limit is reached. Respects .gitignore.",
             json!({
                 "type": "object",
                 "properties": {
@@ -107,7 +107,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         def(
             "apply_patch",
-            "Apply a unified diff to files under the working directory. Either every hunk applies or no file changes.",
+            "Apply a unified diff to files that already exist under the working directory. Either every hunk applies or no file changes. To create a file, use write_file instead.",
             json!({
                 "type": "object",
                 "properties": {

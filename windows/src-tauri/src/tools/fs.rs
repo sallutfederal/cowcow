@@ -20,6 +20,12 @@ const MAX_MATCHES: usize = 100;
 
 /// Joins `path` onto the working directory and refuses to escape it.
 ///
+/// The working directory is a jail, not a starting point: a path that resolves
+/// outside it is refused, whether it climbed out with `..` or named an absolute
+/// location outright. A user who wants the agent somewhere wider sets a wider
+/// `cwd` in the settings — that is a decision, whereas `list_dir` silently
+/// reading all of `C:\` is not.
+///
 /// `..` is resolved lexically rather than by touching the disk, so a path that
 /// does not exist yet still cannot climb out.
 pub fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, String> {
@@ -45,6 +51,13 @@ pub fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, String> {
             }
             Component::Normal(part) => out.push(part),
         }
+    }
+
+    if !out.starts_with(cwd) {
+        return Err(format!(
+            "caminho absoluto fora do cwd: {}",
+            Path::new(path).display()
+        ));
     }
     Ok(out)
 }
@@ -402,6 +415,30 @@ mod tests {
     fn a_path_that_returns_to_the_same_place_is_fine() {
         let cwd = Path::new("C:\\work");
         assert!(resolve(cwd, "src/../src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn an_absolute_path_outside_the_cwd_is_refused() {
+        // The model has no business naming C:\Windows; a wider cwd is the
+        // user's call, made in the settings, not something to guess at.
+        let cwd = Path::new("C:\\work");
+        let err = resolve(cwd, "C:\\Windows\\win.ini").expect_err("absoluto fora do cwd");
+        assert!(err.contains("absoluto fora do cwd"), "{err}");
+        assert!(err.contains("win.ini"), "{err}");
+    }
+
+    #[test]
+    fn an_absolute_path_inside_the_cwd_is_accepted() {
+        let cwd = Path::new("C:\\work");
+        assert!(resolve(cwd, "C:\\work\\src\\main.rs").is_ok());
+    }
+
+    #[tokio::test]
+    async fn reading_outside_the_cwd_is_an_error_not_a_read() {
+        let dir = dir_for("read_outside");
+        let result = read_file("t", &dir, r"C:\Windows\win.ini", None, None).await;
+        assert!(result.is_error, "leu fora do cwd: {:?}", result.content);
+        assert!(result.content.as_str().unwrap().contains("fora do cwd"));
     }
 
     #[tokio::test]

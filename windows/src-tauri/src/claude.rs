@@ -107,15 +107,31 @@ pub struct ToolCtx {
     pub allowed_shell: Vec<String>,
     /// When true, writing tools report what they would do and touch nothing.
     pub dry_run: bool,
+    /// How long `run_shell` may run before the tree is killed.
+    ///
+    /// This lives here and not only on `AgentTurn` because `execute_tool` sees
+    /// nothing but the context, and the timeout is the one limit a tool needs to
+    /// enforce by itself. `AgentTurn::tool_timeout_s` is the default it is
+    /// built from.
+    pub tool_timeout_s: u64,
+}
+
+impl ToolCtx {
+    /// The starting point: the process's own directory, nothing runnable, and
+    /// every writing tool in report-only mode.
+    pub fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            allowed_shell: Vec::new(),
+            dry_run: true,
+            tool_timeout_s: AgentTurn::default().tool_timeout_s,
+        }
+    }
 }
 
 impl Default for ToolCtx {
     fn default() -> Self {
-        Self {
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            allowed_shell: Vec::new(),
-            dry_run: true,
-        }
+        Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 }
 
@@ -519,8 +535,8 @@ pub struct ChatReply {
     pub text: String,
 }
 
-/// One chat turn from the island: no client-side tools, just the model and the
-/// server-side web search.
+/// One chat turn from the island: the model, the server-side web search, and
+/// the client-side tools the user's settings allow.
 ///
 /// A thin wrapper over [`send_agent`] so `chat_send` keeps its shape. The
 /// history is committed only when the turn succeeds, which is why a failed
@@ -530,6 +546,7 @@ pub async fn send(
     model: &str,
     query: String,
     context: Option<ChatContext>,
+    ctx: &ToolCtx,
 ) -> Result<ChatReply, String> {
     let mut messages = chat.snapshot();
 
@@ -558,17 +575,16 @@ pub async fn send(
     content.push(json!({ "type": "text", "text": query }));
     messages.push(json!({ "role": "user", "content": content }));
 
-    // No client-side tool is offered from the island: the assistant answers in
-    // the chat view, it does not go poking around the disk on its own.
     let reply = send_agent(
         &mut messages,
         model,
         SYSTEM_PROMPT,
-        &[],
-        &ToolCtx::default(),
+        &tools::registry(),
+        ctx,
         &AgentTurn::default(),
     )
     .await?;
+
 
     chat.replace(messages);
     Ok(reply)
@@ -749,13 +765,15 @@ type Sent = Rc<RefCell<Vec<Value>>>;
         })
     }
 
-    fn ctx() -> ToolCtx {
-        ToolCtx {
-            cwd: PathBuf::from("C:\\"),
-            allowed_shell: Vec::new(),
-            dry_run: true,
-        }
-    }
+/// A context pointing at an empty directory of its own.
+///
+/// Not `C:\`: the loop really dispatches whatever the scripted response asks
+/// for, so a `list_dir` in a test would otherwise walk the whole disk.
+fn ctx() -> ToolCtx {
+    let dir = std::env::temp_dir().join(format!("coucou-loop-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    ToolCtx::new(dir)
+}
 
     fn history(pairs: usize) -> Vec<Value> {
         let mut chat = Vec::new();

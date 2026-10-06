@@ -257,6 +257,43 @@ fn approval_decline(app: AppHandle, request_id: String) {
 
 // ── Chat, files and secrets ───────────────────────────────────────────────────
 
+/// What one chat turn is allowed to do, read from the settings on every send.
+///
+/// Built fresh each time so flipping the switch in the settings window takes
+/// effect on the next question, with no restart.
+pub fn chat_tool_ctx() -> claude::ToolCtx {
+    let shell = settings::shell_settings();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    claude::ToolCtx {
+        cwd,
+        // An empty list, or the switch off, blocks every command: the allow-list
+        // only means something once the user asked for shell access.
+        allowed_shell: if shell.enabled {
+            shell.allowed.clone()
+        } else {
+            Vec::new()
+        },
+        dry_run: shell.dry_run,
+        tool_timeout_s: shell.timeout_s,
+    }
+}
+
+/// Writes the shell rules the agent obeys.
+///
+/// Its own command rather than a field on `save_settings`, because these are
+/// the settings that decide what the model is allowed to run: they get one
+/// narrow door instead of riding along with every other preference.
+#[tauri::command]
+fn set_shell_settings(shared: State<'_, Shared>, shell: settings::ShellSettings) -> Result<(), String> {
+    {
+        let mut current = shared.settings.lock().unwrap();
+        current.shell = shell.clone();
+        settings::save(&current).map_err(|e| e.to_string())?;
+    }
+    settings::set_shell_settings(shell)
+}
+
 /// One chat turn. The API key and any file bytes stay on the Rust side.
 ///
 /// The provider was picked once in the settings window; the island asks with
@@ -281,7 +318,10 @@ async fn chat_send(
         ollama::PROVIDER_OLLAMA => ollama::send(&local, &base_url, &model, query, context).await,
         // Anything we do not have a dedicated client for speaks the
         // OpenAI-compatible shape, which is Codex, Kimi and every local gateway.
-        ollama::PROVIDER_ANTHROPIC => claude::send(&chat, &model, query, context).await,
+        ollama::PROVIDER_ANTHROPIC => {
+            let ctx = chat_tool_ctx();
+            claude::send(&chat, &model, query, context, &ctx).await
+        }
         _ => {
             let key = api_key_for(&provider)?;
             openai::send(&openai, &model, &base_url, &key, query, context).await
@@ -452,6 +492,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
+            set_shell_settings,
             set_collapsed,
             set_island_rect,
             focus_window,

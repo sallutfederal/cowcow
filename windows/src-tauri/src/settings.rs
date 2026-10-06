@@ -8,6 +8,65 @@ use std::path::PathBuf;
 /// What one provider needs: which model is selected and where it lives. The API
 /// key is not here — it lives in the Credential Manager under one name per
 /// provider, so a single key is typed once and every agent using it benefits.
+/// What the agent is allowed to run when the model asks for a shell.
+///
+/// Nothing runs until the user turns this on and names the programs. An empty
+/// `allowed` blocks everything, which is the state a fresh install is in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellSettings {
+    /// Master switch. Off means `run_shell` answers with an error.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When true, commands are still parsed and allowed, but not executed.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// First token of a command, matched case-insensitively.
+    #[serde(default = "default_allowed_shell")]
+    pub allowed: Vec<String>,
+    #[serde(default = "default_shell_timeout")]
+    pub timeout_s: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Read-only and build programs.
+///
+/// `git` is deliberately absent. An allow-list keyed on the first token cannot
+/// tell `git status` from `git clean -fdx` or `git push --force`, and a default
+/// list is a long-term contract: whoever installs this gets `git` whether or not
+/// they remember to remove it. Adding it is one edit away, and that edit is the
+/// conscious decision. The shells are absent for a blunter reason — allowing one
+/// makes the rest of the list meaningless.
+fn default_allowed_shell() -> Vec<String> {
+    [
+        "cargo", "npm", "pnpm", "node", "python", "ls", "dir", "cat", "type", "rg",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn default_shell_timeout() -> u64 {
+    60
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: true,
+            allowed: default_allowed_shell(),
+            timeout_s: default_shell_timeout(),
+        }
+    }
+}
+
+/// What one provider needs: which model is selected and where it lives. The API
+/// key is not here — it lives in the Credential Manager under one name per
+/// provider, so a single key is typed once and every agent using it benefits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSettings {
@@ -105,6 +164,9 @@ pub struct Settings {
     /// agents differ in what they do, not in who pays for the answer.
     #[serde(default = "default_provider")]
     pub chat_provider: String,
+    /// What the agent may run when the model asks for a shell. Off by default.
+    #[serde(default)]
+    pub shell: ShellSettings,
 }
 
 fn default_model() -> String {
@@ -142,6 +204,7 @@ impl Default for Settings {
             base_url: default_base_url(),
             providers: default_providers(),
             chat_provider: default_provider(),
+            shell: ShellSettings::default(),
         }
     }
 }
@@ -213,6 +276,19 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(settings_path(), json)
+}
+
+/// What the agent may run, as stored. A settings.json with no `shell` block —
+/// every install made before this existed — gets the default: off.
+pub fn shell_settings() -> ShellSettings {
+    load().shell
+}
+
+/// Writes the shell rules back, leaving every other setting untouched.
+pub fn set_shell_settings(shell: ShellSettings) -> Result<(), String> {
+    let mut current = load();
+    current.shell = shell;
+    save(&current).map_err(|e| format!("{e}"))
 }
 
 #[cfg(test)]

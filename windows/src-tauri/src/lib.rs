@@ -332,6 +332,8 @@ async fn chat_send(
     };
     let model = config.model.trim().to_string();
     let base_url = config.base_url;
+    let model = remember_auto_model(&shared, &provider, model, &base_url).await;
+
 
     let session_id = current_session(&session)?;
     let mut history = store.load_session(&session_id)?;
@@ -363,6 +365,84 @@ async fn chat_send(
     }
 
     outcome
+}
+
+/// The model to use when settings has none, as far as the daemon can say.
+///
+/// Returns None whenever the answer should stay empty: another provider, a
+/// model that was already chosen, or a daemon that is down or has nothing
+/// local. The caller then leaves it to the provider to complain, which says
+/// more about a daemon that is not running than this could.
+pub(crate) async fn auto_model(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Option<String> {
+    if !model.trim().is_empty() || provider != ollama::PROVIDER_OLLAMA {
+        return None;
+    }
+    ollama::preferred_model(base_url).await
+}
+
+/// Fills in a model that was never chosen, and remembers it.
+///
+/// Ollama is the one provider with no default: the name only exists once the
+/// model has been pulled. Choosing Ollama in settings is therefore not enough
+/// on its own — the chat would answer "no model selected" until somebody went
+/// and pressed Detect models in the Ollama panel. So when there is nothing to
+/// go on, ask the daemon which local model it has and write that down.
+///
+/// A model the user did choose is never touched: this only fills an empty one.
+/// Returns the model to use, which is the input unchanged when nothing was
+/// filled in — the caller then gets the provider's own error, which says more
+/// about a daemon that is down than this could.
+async fn remember_auto_model(
+    shared: &Shared,
+    provider: &str,
+    model: String,
+    base_url: &str,
+) -> String {
+    if !model.is_empty() || provider != ollama::PROVIDER_OLLAMA {
+        return model;
+    }
+    let Some(found) = auto_model(provider, &model, base_url).await else {
+        return model;
+    };
+    crate::log::line(format!("ollama: usando {found}"));
+    let snapshot = apply_auto_model(shared, base_url, &found);
+    if let Err(err) = settings::save(&snapshot) {
+        // The chat answers either way; it just would not be remembered next
+        // time, and refusing to answer over a preference file would be a
+        // worse trade.
+        eprintln!("[coucou] could not save settings: {err}");
+    }
+    found
+}
+
+/// Writes the auto-chosen model into the running app and hands back the
+/// snapshot to persist.
+///
+/// Separate from the write so the in-memory part can be checked without going
+/// anywhere near the user's own settings.json.
+fn apply_auto_model(
+    shared: &Shared,
+    base_url: &str,
+    found: &str,
+) -> settings::Settings {
+    let mut current = shared.settings.lock().unwrap();
+    match current.providers.get_mut(ollama::PROVIDER_OLLAMA) {
+        Some(entry) => entry.model = found.to_string(),
+        None => {
+            current.providers.insert(
+                ollama::PROVIDER_OLLAMA.to_string(),
+                settings::ProviderSettings {
+                    model: found.to_string(),
+                    base_url: base_url.to_string(),
+                },
+            );
+        }
+    }
+    current.clone()
 }
 
 /// The session the app is talking to, opened on first use.
@@ -467,7 +547,18 @@ pub struct SearchHit {
 /// so a daemon that is not running costs nothing while the island is hidden.
 #[tauri::command]
 async fn ollama_models(shared: State<'_, Shared>) -> Result<Vec<ollama::LocalModel>, String> {
-    let base_url = shared.settings.lock().unwrap().base_url.clone();
+    // The Ollama panel's own address, not the legacy top-level one: a daemon the
+    // user moved in that panel would otherwise be detected against the wrong
+    // host, and the list would come back empty for no visible reason.
+    let base_url = {
+        let current = shared.settings.lock().unwrap();
+        let (_, config) = settings::chat_provider(&current);
+        if config.base_url.trim().is_empty() {
+            ollama::DEFAULT_BASE_URL.to_string()
+        } else {
+            config.base_url.clone()
+        }
+    };
     ollama::models(&base_url).await
 }
 
@@ -661,4 +752,127 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Coucou");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// An Ollama daemon answering `/api/tags`, on a port the OS picked.
+    fn fake_daemon(tags_body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("porta livre");
+        let port = listener.local_addr().expect("endereco").port();
+        let body = tags_body.to_string();
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut head = [0u8; 2048];
+                let _ = stream.read(&mut head);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn an_empty_ollama_model_is_taken_from_the_daemon() {
+        // The cloud model is listed first on purpose. Picking it would send the
+        // chat to Ollama's own servers with no key behind it, which fails in a
+        // way that looks like the chat is broken.
+        let base = fake_daemon(
+            r#"{"models":[{"name":"kimi-k3:cloud"},{"name":"qwen2.5:0.5b"}]}"#,
+        );
+        assert_eq!(
+            auto_model(ollama::PROVIDER_OLLAMA, "", &base).await.as_deref(),
+            Some("qwen2.5:0.5b")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_the_user_chose_is_left_alone() {
+        // No daemon is started: if this reached out it would fail or hang
+        // instead of quietly answering None.
+        assert_eq!(
+            auto_model(ollama::PROVIDER_OLLAMA, "gemma4:31b-cloud", "http://127.0.0.1:1").await,
+            None,
+            "um modelo escolhido nao pode ser trocado"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_provider_never_gets_an_ollama_model() {
+        let base = fake_daemon(r#"{"models":[{"name":"qwen2.5:0.5b"}]}"#);
+        assert_eq!(auto_model("openai", "", &base).await, None);
+    }
+
+    #[tokio::test]
+    async fn nothing_local_leaves_the_model_empty_for_the_provider_to_complain() {
+        let base = fake_daemon(r#"{"models":[{"name":"gemma4:31b-cloud"}]}"#);
+        assert_eq!(
+            auto_model(ollama::PROVIDER_OLLAMA, "  ", &base).await,
+            None,
+            "inventar um nome seria pior do que o erro do provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_is_down_changes_nothing() {
+        assert_eq!(auto_model(ollama::PROVIDER_OLLAMA, "", "http://127.0.0.1:1").await, None);
+    }
+
+    #[tokio::test]
+    async fn the_auto_chosen_model_reaches_both_the_app_and_the_file() {
+        let dir = std::env::temp_dir().join(format!("coucou-remember-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = fake_daemon(r#"{"models":[{"name":"qwen2.5:0.5b"}]}"#);
+
+        let mut s = settings::with_all_agents(settings::Settings {
+            chat_provider: ollama::PROVIDER_OLLAMA.to_string(),
+            ..settings::Settings::default()
+        });
+        s.providers.insert(
+            ollama::PROVIDER_OLLAMA.to_string(),
+            settings::ProviderSettings {
+                model: String::new(),
+                base_url: base.clone(),
+            },
+        );
+        let shared = Shared {
+            settings: Mutex::new(s),
+            gate: Arc::new(island::PollGate::new()),
+        };
+
+        // Deliberately not `remember_auto_model`: that one writes to the real
+        // %APPDATA%\Coucou\settings.json, which a test has no business
+        // touching. The two halves are checked instead.
+        let picked = auto_model(ollama::PROVIDER_OLLAMA, "", &base).await;
+        assert_eq!(picked.as_deref(), Some("qwen2.5:0.5b"));
+
+        let snapshot = apply_auto_model(&shared, &base, picked.as_deref().unwrap());
+        assert_eq!(
+            shared.settings.lock().unwrap().providers[ollama::PROVIDER_OLLAMA].model,
+            "qwen2.5:0.5b",
+            "o app em memoria ficou sem o modelo"
+        );
+
+        // And it survives being written and read back, which is what stops the
+        // next launch from starting over.
+        settings::save_at(&dir, &snapshot).expect("settings gravam");
+        let json = std::fs::read_to_string(dir.join("settings.json")).expect("le o arquivo");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("json valido");
+        assert_eq!(parsed["providers"]["ollama"]["model"], "qwen2.5:0.5b");
+        assert_eq!(
+            parsed["providers"]["ollama"]["baseUrl"], base,
+            "o endereco do daemon foi perdido"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

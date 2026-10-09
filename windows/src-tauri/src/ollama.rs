@@ -48,7 +48,30 @@ pub struct LocalModel {
     pub cloud: bool,
 }
 
-/// `GET {base}/api/tags` — the models the daemon actually has.
+/// Which model the daemon should be asked for, when settings has none.
+///
+/// A local model is what we want: the `-cloud` entries belong to Ollama's
+/// servers, and asking for one with no key behind it just fails differently.
+/// Returns None when the daemon has nothing local, so the caller can say so
+/// rather than picking a name that will not answer.
+pub async fn preferred_model(base_url: &str) -> Option<String> {
+    let list = models(base_url).await.ok()?;
+    list.iter()
+        .find(|m| !m.cloud)
+        .map(|m| m.name.clone())
+}
+
+/// Why the chat cannot start, in words that say what to do about it.
+///
+/// "No model selected" on its own left people hunting through the settings
+/// window; Ollama is the one provider with no default, because the model only
+/// exists once it has been pulled.
+fn no_model_message() -> &'static str {
+    "Ollama has no model selected. Open settings, press Detect models next to \
+     the Model field, and pick one. If the list is empty, run: ollama pull llama3.2"
+}
+
+/// `GET {base}/api/tags` - the models the daemon actually has.
 pub async fn models(base_url: &str) -> Result<Vec<LocalModel>, String> {
     let url = endpoint(base_url, "/api/tags")?;
     let client = reqwest::Client::builder()
@@ -79,7 +102,7 @@ pub async fn send(
 ) -> Result<ChatReply, String> {
     let model = model.trim();
     if model.is_empty() {
-        return Err("No model selected. Pick one in settings.".to_string());
+        return Err(no_model_message().to_string());
     }
     let url = endpoint(base_url, "/api/chat")?;
 
@@ -280,7 +303,80 @@ fn parse_reply(body: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint, parse_reply, parse_tags};
+    use super::{endpoint, no_model_message, parse_reply, parse_tags, preferred_model};
+
+    /// A daemon that answers `/api/tags` with the given JSON, on a port the OS
+    /// picked. Returns the address to hand to the functions under test.
+    fn fake_daemon(tags_body: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("porta livre");
+        let port = listener.local_addr().expect("endereco").port();
+        let body = tags_body.to_string();
+
+        std::thread::spawn(move || {
+            // One connection is enough: each test asks a single question.
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut head = [0u8; 2048];
+            let _ = stream.read(&mut head);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.flush();
+        });
+
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn preferred_model_chooses_a_local_model_over_a_cloud_one() {
+        // The order is the trap: the cloud model comes first in the list, and
+        // asking Ollama's servers for one without a key fails in a way that
+        // looks like the chat is broken.
+        let base = fake_daemon(
+            r#"{"models":[
+                {"name":"kimi-k3:cloud"},
+                {"name":"qwen2.5:0.5b"},
+                {"name":"gemma4:31b-cloud"}
+            ]}"#,
+        );
+        assert_eq!(
+            preferred_model(&base).await.as_deref(),
+            Some("qwen2.5:0.5b"),
+            "escolheu a cloud quando havia local"
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_model_is_none_when_only_cloud_models_exist() {
+        let base = fake_daemon(r#"{"models":[{"name":"gemma4:31b-cloud"}]}"#);
+        assert_eq!(
+            preferred_model(&base).await,
+            None,
+            "inventar um nome de cloud seria pior do que dizer que nao ha"
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_model_is_none_when_the_daemon_is_absent() {
+        // Port 1 is reserved and nothing listens there, so this is the
+        // "Ollama is not running" path without needing to stop anything.
+        assert_eq!(preferred_model("http://127.0.0.1:1").await, None);
+    }
+
+    #[test]
+    fn the_no_model_error_says_where_to_go() {
+        let message = no_model_message();
+        assert!(message.contains("Detect models"), "{message}");
+        assert!(
+            message.contains("ollama pull"),
+            "a mensagem nao diz o que fazer quando a lista esta vazia: {message}"
+        );
+    }
 
     #[test]
     fn endpoint_defaults_to_plain_http_and_drops_trailing_slash() {

@@ -263,19 +263,45 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn load() -> Settings {
-    let loaded = match std::fs::read(settings_path()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => Settings::default(),
+    let path = settings_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return with_all_agents(Settings::default()),
     };
-    with_all_agents(loaded)
+    match parse_settings(&bytes) {
+        Some(loaded) => with_all_agents(loaded),
+        None => {
+            // Returning the defaults is the right thing to run with, but it must
+            // not be allowed to become the only version left: the first save
+            // would overwrite a file we merely failed to read. Windows editors
+            // and PowerShell both add a UTF-8 BOM, which is enough on its own to
+            // get here, so the file is put aside rather than lost.
+            let _ = std::fs::rename(&path, path.with_file_name("settings.unreadable.json"));
+            with_all_agents(Settings::default())
+        }
+    }
+}
+
+/// Reads the file, with the UTF-8 BOM some Windows tools put in front skipped.
+fn parse_settings(bytes: &[u8]) -> Option<Settings> {
+    let body = match bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        Some(rest) => rest,
+        None => bytes,
+    };
+    serde_json::from_slice(body).ok()
 }
 
 pub fn save(settings: &Settings) -> std::io::Result<()> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)?;
+    save_at(&config_dir(), settings)
+}
+
+/// `save` with the directory spelled out, so a test can prove what gets
+/// written without going near the user's own settings.json.
+pub fn save_at(dir: &std::path::Path, settings: &Settings) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     let json = serde_json::to_vec_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(settings_path(), json)
+    std::fs::write(dir.join("settings.json"), json)
 }
 
 /// What the agent may run, as stored. A settings.json with no `shell` block —
@@ -293,6 +319,54 @@ pub fn set_shell_settings(shell: ShellSettings) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::Settings;
+
+    /// A settings.json in a temp dir, written the way a Windows tool would.
+    fn write_file(dir: &std::path::Path, name: &str, bytes: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_make_the_settings_unreadable() {
+        // PowerShell's `Set-Content -Encoding UTF8` and several Windows editors
+        // write one. serde_json refuses a BOM, so this used to read as "no
+        // settings at all" and the defaults were then saved over the file.
+        let settings = Settings { sound_volume: 0.42, ..Settings::default() };
+        let json = serde_json::to_vec(&settings).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("coucou-bom-{}", std::process::id()));
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(&json);
+        write_file(&dir, "settings.json", &with_bom);
+
+        let parsed = parse_settings(&with_bom).expect("o BOM nao pode marcar o arquivo como invalido");
+        assert_eq!(parsed.sound_volume, 0.42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_without_a_bom_still_reads() {
+        let json = serde_json::to_vec(&Settings { sound_volume: 0.42, ..Settings::default() }).unwrap();
+        assert_eq!(parse_settings(&json).unwrap().sound_volume, 0.42);
+    }
+
+    #[test]
+    fn a_file_we_cannot_read_is_set_aside_instead_of_lost() {
+        // Whatever the reason for the parse failure, the first save must not be
+        // able to destroy the only copy.
+        let dir = std::env::temp_dir().join(format!("coucou-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "settings.json", b"{ this is not json");
+
+        assert!(parse_settings(b"{ this is not json").is_none());
+
+        // And the rename that `load` does when it hits this.
+        let path = dir.join("settings.json");
+        std::fs::rename(&path, path.with_file_name("settings.unreadable.json")).unwrap();
+        assert!(path.with_file_name("settings.unreadable.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     #[test]

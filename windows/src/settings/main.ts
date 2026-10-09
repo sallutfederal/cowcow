@@ -3,7 +3,14 @@
 // integrations land here too in a later stage.
 
 import "./settings.css";
-import { Bridge, onEvent, type HookStatus, type LocalModel } from "../core/bridge";
+import {
+  Bridge,
+  IS_TAURI,
+  onEvent,
+  type BootInfo,
+  type HookStatus,
+  type LocalModel,
+} from "../core/bridge";
 import {
   DEFAULT_SETTINGS,
   OLLAMA_DEFAULT_BASE_URL,
@@ -19,10 +26,23 @@ import { h, clear } from "../views/dom";
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
 let version = "";
+/**
+ * Whether `settings` holds what the app actually has, or is still the defaults.
+ *
+ * `Bridge.boot()` answers null when the IPC is not ready yet, and the settings
+ * window is created at startup — so this window can render before the app has
+ * answered. Saving at that point would write the defaults over a real
+ * settings.json, and nothing here is allowed to do that.
+ */
+let settingsLoaded = false;
 
 const root = document.getElementById("settings-root")!;
 
 async function save() {
+  if (!settingsLoaded) {
+    console.warn("[coucou] refusing to save settings that were never loaded");
+    return;
+  }
   await Bridge.saveSettings(settings);
 }
 
@@ -268,6 +288,16 @@ function providerSection(provider: Provider, hasKey: boolean): HTMLElement {
     spellcheck: "false",
   }) as HTMLInputElement;
   const detectBtn = h("button", { text: "Detect models" });
+  if (provider === "ollama") ollamaModelField = modelField;
+
+  const providerNote = h("div", { class: "hint" });
+  ollamaProviderNote = (text: string) => {
+    providerNote.textContent = text;
+  };
+
+  // Opening the settings window on Ollama with nothing chosen is the state the
+  // user just came from, so it gets fixed on the spot.
+  if (provider === "ollama") void fillOllamaModel();
 
   function save() {
     config.model = modelField.value.trim();
@@ -368,6 +398,7 @@ function providerSection(provider: Provider, hasKey: boolean): HTMLElement {
   if (info.addressEditable) {
     rows.push(h("div", { class: "row" }, h("label", { text: "Address" }), baseField));
   }
+  rows.push(providerNote);
 
   return h("section", {},
     h("h2", {}, dot, h("span", { text: info.name })),
@@ -396,17 +427,56 @@ function chatProviderPicker(): HTMLElement {
     settings.chatProvider = select.value as Provider;
     void save();
     note.textContent = noteFor(settings.chatProvider);
+    // Ollama ships without a model, so choosing it is what makes the chat fail
+    // until one exists. Fill it in rather than making that a second errand.
+    if (settings.chatProvider === "ollama") void fillOllamaModel();
   });
 
   const note = h("div", {
     class: "hint",
     text: noteFor(settings.chatProvider),
   });
+  chatProviderNote = (provider: Provider) => {
+    note.textContent = noteFor(provider);
+  };
 
   row.append(h("label", { text: "Chat answers with" }), select);
   return h("section", {}, h("h2", {}, statusDot(true), h("span", { text: "Chat" })), row, note);
 }
 
+
+/**
+ * Picks a local Ollama model for the chat, once.
+ *
+ * Only ever fills an empty field: a model the user chose stays chosen. `flag`
+ * keeps the call from firing twice if it is already running.
+ */
+let ollamaFillDone = false;
+async function fillOllamaModel(): Promise<void> {
+  if (!settingsLoaded) return;
+  const config = settings.providers.ollama;
+  if (!config || config.model.trim() || ollamaFillDone) return;
+  ollamaFillDone = true;
+  try {
+    const models = await Bridge.ollamaModels();
+    const local = models.find((m) => !m.cloud) ?? models[0];
+    if (!local) return;
+    config.model = local.name;
+    if (ollamaModelField) ollamaModelField.value = local.name;
+    await save();
+    chatProviderNote?.(settings.chatProvider);
+    ollamaProviderNote?.(`Using ${local.name} for the chat.`);
+  } catch {
+    // The daemon is not running. The chat says so in words when it is used,
+    // and Detect models next to the Model field still works.
+    ollamaFillDone = false;
+  }
+}
+
+// Lets the helper above refresh the two notes it may have invalidated.
+let chatProviderNote: ((provider: Provider) => void) | null = null;
+let ollamaProviderNote: ((text: string) => void) | null = null;
+let ollamaModelField: HTMLInputElement | null = null;
 
 function noteFor(provider: Provider): string {
   const config = settings.providers[provider];
@@ -605,18 +675,58 @@ async function render() {
   );
 }
 
-async function main() {
-  const boot = await Bridge.boot();
-  if (boot) {
-    settings = { ...settings, ...boot.settings };
-    version = boot.version;
+/**
+ * Loads the app's settings, retrying while the IPC is not up.
+ *
+ * This window is created during startup, so its first `boot` can land before
+ * the bridge answers — and `Bridge.call` turns a failure into `null` rather
+ * than throwing. Without the retries the window would sit on the defaults for
+ * its whole life, and the save guard would then refuse every change the user
+ * made in it.
+ */
+async function loadBoot(): Promise<BootInfo | null> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const boot = await Bridge.boot();
+    if (boot?.settings) return boot;
+    if (!IS_TAURI) return null; // plain browser, nothing to retry
+    await new Promise((r) => setTimeout(r, 300));
   }
+  return null;
+}
 
-  await render();
+async function main() {
+  await bootInto();
 
+  // The other window changes settings too; follow it rather than saving over
+  // what it just wrote.
   void onEvent<Settings>("settings-changed", (s) => {
     settings = { ...settings, ...s };
   });
+
+  // The save guard refuses to write settings that were never loaded, so this
+  // window has to be able to leave that state. Startup created it hidden, and
+  // a `boot` that landed too early can fail; retrying when the user actually
+  // looks at the window is what makes it usable instead of inert. Only when
+  // there is something to recover — redrawing otherwise would throw away
+  // whatever is being typed.
+  window.addEventListener("focus", () => {
+    if (!settingsLoaded) void bootInto();
+  });
+}
+
+/** Loads the app's settings and redraws. Does nothing once they are in hand. */
+async function bootInto() {
+  if (settingsLoaded) return;
+  const boot = await loadBoot();
+  if (!boot?.settings) {
+    if (IS_TAURI) console.warn("[coucou] settings not loaded; will retry on focus");
+    return;
+  }
+  settings = { ...settings, ...boot.settings };
+  version = boot.version;
+  settingsLoaded = true;
+  ollamaFillDone = false; // the chosen model may have changed
+  await render();
 }
 
 void main();
